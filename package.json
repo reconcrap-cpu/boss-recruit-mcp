@@ -1,0 +1,42 @@
+{
+  "name": "@reconcrap/boss-recruit-mcp",
+  "version": "1.0.0",
+  "description": "Unified MCP pipeline for boss-search-cli and boss-screen-cli",
+  "keywords": [
+    "boss",
+    "mcp",
+    "codex",
+    "recruiting",
+    "boss-zhipin"
+  ],
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "boss-recruit-mcp": "bin/boss-recruit-mcp.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "cli": "node src/cli.js",
+    "install:local": "node src/cli.js install",
+    "test:parser": "node src/test-parser.js"
+  },
+  "files": [
+    "bin",
+    "config/screening-config.example.json",
+    "skills",
+    "src",
+    "vendor",
+    "README.md"
+  ],
+  "dependencies": {
+    "chrome-remote-interface": "^0.33.3",
+    "ws": "^8.19.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT"
+}

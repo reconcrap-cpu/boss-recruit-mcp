@@ -1,0 +1,7 @@
+{
+  "baseUrl": "https://your-llm-endpoint.example.com/v1",
+  "apiKey": "replace-with-your-api-key",
+  "model": "replace-with-your-model-name",
+  "calibrationFile": "../boss-screen-cli/favorite-calibration.json",
+  "outputDir": "../boss-screen-cli/output"
+}

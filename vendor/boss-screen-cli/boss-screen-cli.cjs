@@ -18,6 +18,7 @@ const apiKey = args.apikey || args.apiKey;
 const model = args.model;
 const criteria = args.criteria;
 const targetCount = parseInt(args.target || args.targetCount || '10');
+const debugPort = Number.parseInt(args.port || '9222', 10);
 const configFile = args.config || 'favorite-calibration.json';
 const outputCsv = args.output || `筛选结果_${Date.now()}.csv`;
 
@@ -39,7 +40,7 @@ function loadCalibration() {
 
 async function getChromeTab() {
     return new Promise((resolve, reject) => {
-        http.get('http://localhost:9222/json/list', (res) => {
+        http.get(`http://localhost:${debugPort}/json/list`, (res) => {
             let data = '';
             res.on('data', chunk => data += chunk);
             res.on('end', () => {

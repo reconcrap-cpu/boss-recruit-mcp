@@ -1,15 +1,34 @@
 import { parseRecruitInstruction } from "./parser.js";
 import { runPipelinePreflight, runSearchCli, runScreenCli } from "./adapters.js";
 
+function buildRequiredConfirmations(parsedResult) {
+  const confirmations = [];
+
+  if (parsedResult.needs_search_params_confirmation) {
+    confirmations.push("search_params");
+  }
+  if (parsedResult.needs_keyword_confirmation) {
+    confirmations.push("keyword");
+  }
+  if (parsedResult.has_unresolved_missing_fields) {
+    confirmations.push("missing_fields_or_defaults");
+  }
+
+  return confirmations;
+}
+
 function buildNeedInputResponse(parsedResult) {
   return {
     status: "NEED_INPUT",
     missing_fields: parsedResult.missing_fields,
+    proposed_keyword: parsedResult.proposed_keyword,
+    required_confirmations: buildRequiredConfirmations(parsedResult),
     search_params: parsedResult.searchParams,
     screen_params: parsedResult.screenParams,
+    review: parsedResult.review,
     error: {
       code: "MISSING_REQUIRED_FIELDS",
-      message: "缺少必要字段，请一次性补充缺失项后再执行。",
+      message: "缺少必要字段。请先补齐缺失项；若要按默认值继续，必须先明确确认默认值及其风险。",
       retryable: true
     }
   };
@@ -19,11 +38,13 @@ function buildNeedConfirmationResponse(parsedResult) {
   return {
     status: "NEED_CONFIRMATION",
     proposed_keyword: parsedResult.proposed_keyword,
+    required_confirmations: buildRequiredConfirmations(parsedResult),
     search_params: {
       ...parsedResult.searchParams,
-      keyword: parsedResult.proposed_keyword
+      keyword: parsedResult.proposed_keyword || parsedResult.searchParams.keyword
     },
-    screen_params: parsedResult.screenParams
+    screen_params: parsedResult.screenParams,
+    review: parsedResult.review
   };
 }
 
@@ -121,24 +142,31 @@ export async function runRecruitPipeline({
     overrides
   });
 
-  if (parsed.needs_keyword_confirmation) {
-    return buildNeedConfirmationResponse(parsed);
+  if (parsed.has_unresolved_missing_fields) {
+    return buildNeedInputResponse(parsed);
   }
 
-  if (parsed.missing_fields.length > 0) {
-    return buildNeedInputResponse(parsed);
+  if (parsed.needs_keyword_confirmation || parsed.needs_search_params_confirmation) {
+    return buildNeedConfirmationResponse(parsed);
   }
 
   const preflight = runPipelinePreflight(workspaceRoot);
   if (!preflight.ok) {
+    const missingCalibration = preflight.checks.find(
+      (check) => check.key === "favorite_calibration" && !check.ok
+    );
     return buildFailedResponse(
-      "PIPELINE_PREFLIGHT_FAILED",
-      "招聘流水线运行前检查失败，请先修复缺失的本地依赖或配置文件。",
+      missingCalibration ? "CALIBRATION_REQUIRED" : "PIPELINE_PREFLIGHT_FAILED",
+      missingCalibration
+        ? `尚未完成收藏按钮校准。请先在当前环境打开 Boss 搜索页，打开任意候选人详情页，点击收藏，再点击取消收藏，然后关闭详情页；接着运行 boss-recruit-mcp calibrate --port ${preflight.debug_port} --output "${preflight.calibration_path}" 生成校准文件。不要复制其他目录或历史遗留的 favorite-calibration.json。`
+        : "招聘流水线运行前检查失败，请先修复缺失的本地依赖或配置文件。",
       {
         search_params: parsed.searchParams,
         screen_params: parsed.screenParams,
         diagnostics: {
-          checks: preflight.checks
+          checks: preflight.checks,
+          debug_port: preflight.debug_port,
+          calibration_path: preflight.calibration_path
         }
       }
     );

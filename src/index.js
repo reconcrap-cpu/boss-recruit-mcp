@@ -1,11 +1,13 @@
 import path from "node:path";
+import { createRequire } from "node:module";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { runRecruitPipeline } from "./pipeline.js";
 
+const require = createRequire(import.meta.url);
+const { version: SERVER_VERSION } = require("../package.json");
 const TOOL_NAME = "run_recruit_pipeline";
 const SERVER_NAME = "boss-recruit-mcp";
-const SERVER_VERSION = "1.0.0";
 
 function writeMessage(message) {
   const body = JSON.stringify(message);
@@ -36,13 +38,24 @@ function createToolSchema() {
           type: "object",
           properties: {
             keyword_confirmed: { type: "boolean" },
-            keyword_value: { type: "string" }
+            keyword_value: { type: "string" },
+            search_params_confirmed: { type: "boolean" },
+            use_default_for_missing: { type: "boolean" }
           },
           additionalProperties: false
         },
         overrides: {
           type: "object",
           properties: {
+            city: { type: "string" },
+            degree: { type: "string" },
+            schools: {
+              anyOf: [
+                { type: "array", items: { type: "string" } },
+                { type: "string" }
+              ]
+            },
+            keyword: { type: "string" },
             target_count: { type: "integer", minimum: 1 }
           },
           additionalProperties: false

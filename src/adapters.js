@@ -16,6 +16,14 @@ function getUserConfigPath() {
   return path.join(getCodexHome(), "boss-recruit-mcp", "screening-config.json");
 }
 
+function getUserCalibrationPath() {
+  return path.join(getCodexHome(), "boss-recruit-mcp", "favorite-calibration.json");
+}
+
+function getDesktopDir() {
+  return path.join(os.homedir(), "Desktop");
+}
+
 function resolveScreenConfigPath(workspaceRoot) {
   const envConfigPath = process.env.BOSS_RECRUIT_SCREEN_CONFIG
     ? path.resolve(process.env.BOSS_RECRUIT_SCREEN_CONFIG)
@@ -182,10 +190,36 @@ function loadScreenConfig(configPath) {
   }
 }
 
+function resolveDebugPort(config) {
+  const fromEnv = Number.parseInt(process.env.BOSS_RECRUIT_CHROME_PORT || "", 10);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  const fromConfig = Number.parseInt(String(config?.debugPort || ""), 10);
+  if (Number.isFinite(fromConfig) && fromConfig > 0) return fromConfig;
+  return 9222;
+}
+
+function resolveWorkspaceDebugPort(workspaceRoot) {
+  const configPath = resolveScreenConfigPath(workspaceRoot);
+  if (pathExists(configPath)) {
+    const loaded = loadScreenConfig(configPath);
+    if (loaded.ok) {
+      return resolveDebugPort(loaded.config);
+    }
+  }
+  return resolveDebugPort(null);
+}
+
 export function runPipelinePreflight(workspaceRoot) {
   const searchDir = resolveSearchCliDir(workspaceRoot);
   const screenDir = resolveScreenCliDir(workspaceRoot);
   const screenConfigPath = resolveScreenConfigPath(workspaceRoot);
+  const loaded = pathExists(screenConfigPath) ? loadScreenConfig(screenConfigPath) : null;
+  const debugPort = loaded?.ok ? resolveDebugPort(loaded.config) : resolveDebugPort(null);
+  const calibrationPath = loaded?.ok
+    ? (loaded.config.calibrationFile
+      ? path.resolve(path.dirname(screenConfigPath), loaded.config.calibrationFile)
+      : getUserCalibrationPath())
+    : getUserCalibrationPath();
   const checks = [
     {
       key: "search_cli_dir",
@@ -216,12 +250,20 @@ export function runPipelinePreflight(workspaceRoot) {
       ok: pathExists(screenConfigPath),
       path: screenConfigPath,
       message: "screening-config.json 不存在"
+    },
+    {
+      key: "favorite_calibration",
+      ok: pathExists(calibrationPath),
+      path: calibrationPath,
+      message: "favorite-calibration.json 不存在，请先完成收藏按钮校准"
     }
   ];
 
   return {
     ok: checks.every((item) => item.ok),
-    checks
+    checks,
+    debug_port: debugPort,
+    calibration_path: calibrationPath
   };
 }
 
@@ -231,6 +273,7 @@ function localDirHint(workspaceRoot, dirName) {
 
 export async function runSearchCli({ workspaceRoot, searchParams }) {
   const searchDir = resolveSearchCliDir(workspaceRoot);
+  const debugPort = resolveWorkspaceDebugPort(workspaceRoot);
   if (!searchDir) {
     return {
       ok: false,
@@ -251,7 +294,9 @@ export async function runSearchCli({ workspaceRoot, searchParams }) {
     "--schools",
     searchParams.schools.join(","),
     "--city",
-    searchParams.city
+    searchParams.city,
+    "--port",
+    String(debugPort)
   ];
 
   const result = await runProcess({
@@ -304,7 +349,8 @@ export async function runScreenCli({ workspaceRoot, screenParams }) {
 
   const calibration = loaded.config.calibrationFile
     ? path.resolve(configBaseDir, loaded.config.calibrationFile)
-    : path.join(screenDir, "favorite-calibration.json");
+    : getUserCalibrationPath();
+  const debugPort = resolveDebugPort(loaded.config);
 
   const outputName = `筛选结果_${Date.now()}.csv`;
   let outputPath = outputName;
@@ -312,6 +358,10 @@ export async function runScreenCli({ workspaceRoot, screenParams }) {
     const resolvedOutputDir = path.resolve(configBaseDir, loaded.config.outputDir);
     fs.mkdirSync(resolvedOutputDir, { recursive: true });
     outputPath = path.join(resolvedOutputDir, outputName);
+  } else {
+    const desktopDir = getDesktopDir();
+    fs.mkdirSync(desktopDir, { recursive: true });
+    outputPath = path.join(desktopDir, outputName);
   }
 
   const args = [
@@ -322,6 +372,8 @@ export async function runScreenCli({ workspaceRoot, screenParams }) {
     loaded.config.apiKey,
     "--model",
     loaded.config.model,
+    "--port",
+    String(debugPort),
     "--criteria",
     screenParams.criteria,
     "--targetCount",

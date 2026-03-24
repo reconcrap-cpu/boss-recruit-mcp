@@ -3,6 +3,23 @@ const SEARCH_SCHOOL_MAP = {
   "211": "211院校",
   "qs100": "QS 100"
 };
+const KNOWN_SCHOOL_LABELS = new Set(Object.values(SEARCH_SCHOOL_MAP));
+const DEFAULT_PARAM_VALUES = {
+  city: null,
+  degree: "不限",
+  schools: [],
+  keyword: "算法工程师",
+  target_count: 10
+};
+const DEFAULT_PARAM_LABELS = {
+  city: "不限城市",
+  degree: "不限",
+  schools: "不限院校标签",
+  keyword: "算法工程师",
+  target_count: 10
+};
+const DEGREE_VALUES = new Set(["不限", "本科", "本科及以上", "硕士及以上", "博士"]);
+const CITY_STOP_PATTERN = /(?:筛选|搜索|查找|找|做过|从事过|有过|相关|的人选|的人|并且|且|学历|学校|目标|必须|优先|，|。|；|;|,)/;
 
 function normalizeText(input) {
   return String(input || "").replace(/\s+/g, " ").trim();
@@ -12,16 +29,47 @@ function uniqueList(items) {
   return Array.from(new Set(items.filter(Boolean)));
 }
 
+function normalizeSchoolLabel(value) {
+  if (typeof value !== "string") return null;
+  const raw = value.trim();
+  if (!raw) return null;
+
+  if (KNOWN_SCHOOL_LABELS.has(raw)) {
+    return raw;
+  }
+
+  const compact = raw.toLowerCase().replace(/\s+/g, "");
+  return SEARCH_SCHOOL_MAP[compact] || SEARCH_SCHOOL_MAP[raw] || raw;
+}
+
+function sanitizeCityCandidate(value) {
+  if (typeof value !== "string") return null;
+  let candidate = value.trim();
+  if (!candidate) return null;
+
+  candidate = candidate.replace(/^(在|是|为)\s*/, "").trim();
+  const stopIndex = candidate.search(CITY_STOP_PATTERN);
+  if (stopIndex >= 0) {
+    candidate = candidate.slice(0, stopIndex).trim();
+  }
+
+  candidate = candidate.replace(/[的\s]+$/g, "").trim();
+  return candidate || null;
+}
+
 function extractCity(text) {
   const explicitPatterns = [
-    /地点(?:在|是|为|:|：)?\s*([^\s，。；;、]+)/i,
-    /城市(?:在|是|为|:|：)?\s*([^\s，。；;、]+)/i
+    /地点(?:在|是|为|:|：)?\s*([^\n，。；;、]+)/i,
+    /城市(?:在|是|为|:|：)?\s*([^\n，。；;、]+)/i,
+    /工作地(?:在|是|为|:|：)?\s*([^\n，。；;、]+)/i,
+    /base(?:在|是|为|:|：)?\s*([^\n，。；;、]+)/i
   ];
 
   for (const pattern of explicitPatterns) {
     const m = text.match(pattern);
     if (m && m[1]) {
-      return m[1].trim();
+      const city = sanitizeCityCandidate(m[1]);
+      if (city) return city;
     }
   }
 
@@ -42,6 +90,24 @@ function extractSchools(text) {
   if (/(^|[^0-9])211([^0-9]|$)/.test(text)) schools.push(SEARCH_SCHOOL_MAP["211"]);
   if (/(qs\s*100|QS\s*100|qs100|QS100)/.test(text)) schools.push(SEARCH_SCHOOL_MAP["qs100"]);
   return uniqueList(schools);
+}
+
+function normalizeStringOverride(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized || null;
+}
+
+function normalizeSchoolsOverride(value) {
+  if (Array.isArray(value)) {
+    return uniqueList(value.map(normalizeSchoolLabel));
+  }
+
+  if (typeof value === "string") {
+    return uniqueList(value.split(/[，,]/).map(normalizeSchoolLabel));
+  }
+
+  return null;
 }
 
 function extractKeywordExplicit(text) {
@@ -145,6 +211,10 @@ function buildScreenCriteria(text, searchParams) {
 }
 
 function resolveKeyword(parsed, confirmation) {
+  if (parsed.keyword_override) {
+    return { keyword: parsed.keyword_override, needsConfirmation: false, proposedKeyword: null };
+  }
+
   const explicit = parsed.keyword_explicit;
   const auto = parsed.keyword_auto;
   const confirmed = confirmation && confirmation.keyword_confirmed === true;
@@ -175,6 +245,97 @@ function resolveKeyword(parsed, confirmation) {
   return { keyword: null, needsConfirmation: false, proposedKeyword: null };
 }
 
+function collectSuspiciousFields(searchParams, screenParams) {
+  const suspicious = [];
+
+  if (searchParams.city && (/\s/.test(searchParams.city) || CITY_STOP_PATTERN.test(searchParams.city) || searchParams.city.length > 8)) {
+    suspicious.push({
+      field: "city",
+      value: searchParams.city,
+      reason: "城市提取结果看起来包含多余短语，请确认是否为标准城市名。"
+    });
+  }
+
+  if (searchParams.degree && !DEGREE_VALUES.has(searchParams.degree)) {
+    suspicious.push({
+      field: "degree",
+      value: searchParams.degree,
+      reason: "学历提取结果不在预期枚举内，请确认。"
+    });
+  }
+
+  if (searchParams.keyword && /城市|学历|学校|目标人数|目标数量|筛选\d+位/i.test(searchParams.keyword)) {
+    suspicious.push({
+      field: "keyword",
+      value: searchParams.keyword,
+      reason: "关键词看起来混入了筛选条件，请确认是否只保留核心方向词。"
+    });
+  }
+
+  if (screenParams.target_count && (!Number.isInteger(screenParams.target_count) || screenParams.target_count <= 0)) {
+    suspicious.push({
+      field: "target_count",
+      value: screenParams.target_count,
+      reason: "目标人数不是有效正整数，请确认。"
+    });
+  }
+
+  return suspicious;
+}
+
+function buildDefaultPreview(missingFields, options = {}) {
+  const { skipKeywordDefault = false } = options;
+  return missingFields.reduce((acc, field) => {
+    if (field === "keyword" && skipKeywordDefault) {
+      return acc;
+    }
+    acc[field] = DEFAULT_PARAM_LABELS[field];
+    return acc;
+  }, {});
+}
+
+function applyDefaults(searchParams, screenParams, missingFields, useDefaultForMissing, options = {}) {
+  const { skipKeywordDefault = false } = options;
+  if (!useDefaultForMissing) {
+    return {
+      searchParams,
+      screenParams,
+      appliedDefaults: {}
+    };
+  }
+
+  const appliedDefaults = {};
+  const nextSearchParams = { ...searchParams };
+  const nextScreenParams = { ...screenParams };
+
+  if (missingFields.includes("city")) {
+    nextSearchParams.city = DEFAULT_PARAM_VALUES.city;
+    appliedDefaults.city = DEFAULT_PARAM_LABELS.city;
+  }
+  if (missingFields.includes("degree")) {
+    nextSearchParams.degree = DEFAULT_PARAM_VALUES.degree;
+    appliedDefaults.degree = DEFAULT_PARAM_LABELS.degree;
+  }
+  if (missingFields.includes("schools")) {
+    nextSearchParams.schools = DEFAULT_PARAM_VALUES.schools.slice();
+    appliedDefaults.schools = DEFAULT_PARAM_LABELS.schools;
+  }
+  if (missingFields.includes("keyword") && !skipKeywordDefault) {
+    nextSearchParams.keyword = DEFAULT_PARAM_VALUES.keyword;
+    appliedDefaults.keyword = DEFAULT_PARAM_LABELS.keyword;
+  }
+  if (missingFields.includes("target_count")) {
+    nextScreenParams.target_count = DEFAULT_PARAM_VALUES.target_count;
+    appliedDefaults.target_count = DEFAULT_PARAM_LABELS.target_count;
+  }
+
+  return {
+    searchParams: nextSearchParams,
+    screenParams: nextScreenParams,
+    appliedDefaults
+  };
+}
+
 export function parseRecruitInstruction({ instruction, confirmation, overrides }) {
   const text = normalizeText(instruction);
   const parsed = {
@@ -186,36 +347,76 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
     target_count: extractTargetCount(text)
   };
 
-  if (overrides && Number.isFinite(overrides.target_count) && overrides.target_count > 0) {
-    parsed.target_count = Number.parseInt(String(overrides.target_count), 10);
+  if (overrides) {
+    const overrideCity = sanitizeCityCandidate(normalizeStringOverride(overrides.city));
+    const overrideDegree = normalizeStringOverride(overrides.degree);
+    const overrideSchools = normalizeSchoolsOverride(overrides.schools);
+    const overrideKeyword = normalizeStringOverride(overrides.keyword);
+
+    if (overrideCity) parsed.city = overrideCity;
+    if (overrideDegree) parsed.degree = overrideDegree;
+    if (overrideSchools && overrideSchools.length > 0) parsed.schools = overrideSchools;
+    if (overrideKeyword) parsed.keyword_override = overrideKeyword;
+
+    if (Number.isFinite(overrides.target_count) && overrides.target_count > 0) {
+      parsed.target_count = Number.parseInt(String(overrides.target_count), 10);
+    }
   }
 
   const keywordResolution = resolveKeyword(parsed, confirmation);
-  const searchParams = {
+  const baseSearchParams = {
     city: parsed.city,
     degree: parsed.degree,
     schools: parsed.schools,
     keyword: keywordResolution.keyword
   };
 
-  const screenParams = {
-    criteria: buildScreenCriteria(text, searchParams),
+  const baseScreenParams = {
+    criteria: buildScreenCriteria(text, baseSearchParams),
     target_count: parsed.target_count
   };
 
-  const missing = [];
-  if (!searchParams.city) missing.push("city");
-  if (!searchParams.degree) missing.push("degree");
-  if (!searchParams.schools || searchParams.schools.length === 0) missing.push("schools");
-  if (!searchParams.keyword) missing.push("keyword");
-  if (!screenParams.target_count) missing.push("target_count");
+  const missingBeforeDefaults = [];
+  if (!baseSearchParams.city) missingBeforeDefaults.push("city");
+  if (!baseSearchParams.degree) missingBeforeDefaults.push("degree");
+  if (!baseSearchParams.schools || baseSearchParams.schools.length === 0) missingBeforeDefaults.push("schools");
+  if (!baseSearchParams.keyword) missingBeforeDefaults.push("keyword");
+  if (!baseScreenParams.target_count) missingBeforeDefaults.push("target_count");
+
+  const useDefaultForMissing = confirmation?.use_default_for_missing === true;
+  const skipKeywordDefault = keywordResolution.needsConfirmation;
+  const defaultPreview = buildDefaultPreview(missingBeforeDefaults, { skipKeywordDefault });
+  const { searchParams, screenParams, appliedDefaults } = applyDefaults(
+    baseSearchParams,
+    baseScreenParams,
+    missingBeforeDefaults,
+    useDefaultForMissing,
+    { skipKeywordDefault }
+  );
+  const suspicious_fields = collectSuspiciousFields(searchParams, screenParams);
 
   return {
     parsed,
     searchParams,
     screenParams,
-    missing_fields: missing,
+    missing_fields: missingBeforeDefaults,
+    has_unresolved_missing_fields: missingBeforeDefaults.length > 0 && !useDefaultForMissing,
+    suspicious_fields,
     needs_keyword_confirmation: keywordResolution.needsConfirmation,
-    proposed_keyword: keywordResolution.proposedKeyword
+    needs_search_params_confirmation: confirmation?.search_params_confirmed !== true,
+    proposed_keyword: keywordResolution.proposedKeyword,
+    default_preview: defaultPreview,
+    applied_defaults: appliedDefaults,
+    review: {
+      extracted_search_params: baseSearchParams,
+      extracted_screen_params: baseScreenParams,
+      current_search_params: searchParams,
+      current_screen_params: screenParams,
+      missing_fields: missingBeforeDefaults,
+      has_unresolved_missing_fields: missingBeforeDefaults.length > 0 && !useDefaultForMissing,
+      suspicious_fields,
+      default_preview: defaultPreview,
+      applied_defaults: appliedDefaults
+    }
   };
 }

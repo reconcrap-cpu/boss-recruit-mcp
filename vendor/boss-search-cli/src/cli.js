@@ -3,7 +3,9 @@ import { BossSearcher } from './boss-searcher.js';
 
 class BossSearchCLI {
   constructor() {
-    this.searcher = new BossSearcher(9222);
+    const args = this.parseArgs();
+    this.args = args;
+    this.searcher = new BossSearcher(args.port);
   }
 
   async run() {
@@ -11,12 +13,10 @@ class BossSearchCLI {
     console.log('  Boss直聘搜索自动化工具');
     console.log('========================================\n');
 
-    const args = this.parseArgs();
-    
     const connected = await this.searcher.connect();
     if (!connected) {
       console.log('\n请确保Chrome已通过以下命令启动：');
-      console.log('chrome.exe --remote-debugging-port=9222');
+      console.log(`chrome.exe --remote-debugging-port=${this.args.port}`);
       process.exit(1);
     }
 
@@ -35,12 +35,12 @@ class BossSearchCLI {
 
       // 第二步：设置其他过滤条件（城市、学历、院校等）
       if (args.city) {
-        await this.searcher.setCity(args.city);
+        await this.searcher.setCity(this.args.city);
         await this.searcher.sleep(500);
         console.log('');
       }
 
-      await this.searchWithConfig(args);
+      await this.searchWithConfig(this.args);
     } catch (error) {
       console.error('❌ 执行出错:', error);
     } finally {
@@ -54,6 +54,7 @@ class BossSearchCLI {
       degree: '不限',
       schools: [],
       city: null,
+      port: 9222,
       experience: '不限',
       ageMin: null,
       ageMax: null
@@ -84,6 +85,11 @@ class BossSearchCLI {
         });
       } else if (arg === '--city' || arg === '-c') {
         args.city = argv[++i];
+      } else if (arg === '--port' || arg === '-p') {
+        const port = Number.parseInt(argv[++i], 10);
+        if (Number.isFinite(port) && port > 0) {
+          args.port = port;
+        }
       }
     }
 

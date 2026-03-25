@@ -149,17 +149,24 @@ export class BossSearcher {
         const safeSchool = school.replace(/'/g, "\\'");
         const result = await this.evaluate(
           '(function() {' +
+          '  const normalizeText = function(value) {' +
+          '    return String(value || "").replace(/\\s+/g, "").trim();' +
+          '  };' +
           '  const iframe = document.querySelector("iframe");' +
           '  if (!iframe || !iframe.contentWindow) return { error: "no iframe" };' +
           '  const doc = iframe.contentWindow.document;' +
-          '  const schoolItems = doc.querySelectorAll(".school-item");' +
-          '  const targetTexts = ["统招本科", "双一流院校", "211院校", "985院校", "留学生", "QS 100", "QS 500"];' +
-          '  const targetIdx = targetTexts.indexOf("' + safeSchool + '");' +
-          '  if (targetIdx >= 0 && schoolItems[targetIdx]) {' +
-          '    const label = schoolItems[targetIdx].querySelector("label.checkbox");' +
+          '  const schoolItems = Array.from(doc.querySelectorAll(".school-item"));' +
+          '  const targetSchool = normalizeText("' + safeSchool + '");' +
+          '  const schoolItem = schoolItems.find(function(item) {' +
+          '    const textNode = item.querySelector(".checkbox-text");' +
+          '    return normalizeText(textNode ? textNode.textContent : item.textContent) === targetSchool;' +
+          '  });' +
+          '  if (schoolItem) {' +
+          '    const label = schoolItem.querySelector("label.checkbox");' +
           '    if (label) {' +
-          '      label.click();' +
-          '      const checkbox = schoolItems[targetIdx].querySelector(".checkbox-input");' +
+          '      const checkbox = schoolItem.querySelector(".checkbox-input");' +
+          '      const isChecked = label.classList.contains("checked") || Boolean(checkbox && checkbox.checked);' +
+          '      if (!isChecked) label.click();' +
           '      return { success: true, school: "' + safeSchool + '", checked: checkbox ? checkbox.checked : false };' +
           '    }' +
           '  }' +
@@ -614,6 +621,42 @@ export class BossSearcher {
       return result;
     } catch (e) {
       console.log('  执行搜索时出错:', e.message);
+      return { error: e.message };
+    }
+  }
+
+  async setRecentViewedFilter(enabled = true) {
+    console.log('🕒 设置近14天查看过滤: ' + (enabled ? '开启' : '关闭'));
+    try {
+      const result = await this.evaluate(
+        '(function() {' +
+        '  const iframe = document.querySelector("iframe");' +
+        '  if (!iframe || !iframe.contentWindow) return { error: "no iframe" };' +
+        '  const doc = iframe.contentWindow.document;' +
+        '  const normalizeText = function(value) {' +
+        '    return String(value || "").replace(/\\s+/g, "").trim();' +
+        '  };' +
+        '  const targetLabel = doc.querySelector(\'label.checkbox.high_search_checkbox[ka="search_change_view_resume"]\')' +
+        '    || Array.from(doc.querySelectorAll("label.checkbox.high_search_checkbox")).find(function(label) {' +
+        '      const textNode = label.querySelector(".checkbox-text");' +
+        '      return normalizeText(textNode ? textNode.textContent : label.textContent) === "过滤近14天查看";' +
+        '    });' +
+        '  if (!targetLabel) return { error: "recent viewed filter not found" };' +
+        '  const checkbox = targetLabel.querySelector(".checkbox-input");' +
+        '  const currentChecked = targetLabel.classList.contains("checked") || Boolean(checkbox && checkbox.checked);' +
+        '  const desiredChecked = ' + (enabled ? 'true' : 'false') + ';' +
+        '  if (currentChecked !== desiredChecked) {' +
+        '    targetLabel.click();' +
+        '  }' +
+        '  const finalChecked = targetLabel.classList.contains("checked") || Boolean(checkbox && checkbox.checked);' +
+        '  return { success: true, checked: finalChecked, changed: currentChecked !== desiredChecked };' +
+        '})()'
+      );
+      await this.sleep(1200);
+      console.log('  近14天查看过滤: ' + (result && result.checked ? '✅ 已开启' : '⬜ 未开启'));
+      return result;
+    } catch (e) {
+      console.log('  设置近14天查看过滤时出错:', e.message);
       return { error: e.message };
     }
   }

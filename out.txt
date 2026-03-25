@@ -1,0 +1,27 @@
+{
+  "status": "FAILED",
+  "error": {
+    "code": "SEARCH_CLI_FAILED",
+    "message": "搜索工具执行失败，请检查 Chrome 远程调试、Boss 登录状态和页面可访问性。",
+    "retryable": true
+  },
+  "search_params": {
+    "city": "杭州",
+    "degree": "本科",
+    "schools": [
+      "985院校",
+      "211院校",
+      "QS 100"
+    ],
+    "keyword": "推荐系统"
+  },
+  "screen_params": {
+    "criteria": "做过推荐系统",
+    "target_count": 10
+  },
+  "diagnostics": {
+    "exit_code": 1,
+    "error_code": null,
+    "stderr": "❌ 连接失败: connect ECONNREFUSED 127.0.0.1:9222\n"
+  }
+}

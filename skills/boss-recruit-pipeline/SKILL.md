@@ -22,6 +22,7 @@
 
 1. 先检查 MCP 是否已安装 / 可调用；若未安装，优先执行：
    - `npx @reconcrap/boss-recruit-mcp install`
+   - 若要给 Cursor / Trae / Claude Code / OpenClaw 快速接入，执行 `boss-recruit-mcp mcp-config --client all`，并把生成文件中的 `mcpServers` 合并到对应客户端配置
 2. 若用户还未确认 Chrome 调试端口，必须先询问：
    - 建议使用 `9222`
    - 但也允许用户明确提供一个已在使用的其他远程调试端口
@@ -31,7 +32,11 @@
 5. 若 Chrome 未以远程调试模式启动，优先帮助用户启动：
    - `boss-recruit-mcp launch-chrome --port <port>`
    - 打开页面：`https://www.zhipin.com/web/chat/search`
-6. 只有在以上条件满足后，才继续调用流水线。
+6. 启动新的 Chrome debugging 实例后，必须检查页面是否仍停留在 `https://www.zhipin.com/web/chat/search`：
+   - 若仍在 search 页面，可继续；
+   - 若跳转到登录页、首页或其他 Boss 页面，视为“需要重新登录”；
+   - 必须明确提示用户手动登录 Boss，并等待用户回复“已登录/可以继续”后，才能继续后续动作。
+7. 只有在以上条件满足后，才继续调用流水线。
 
 ## Calibration Requirement
 
@@ -74,12 +79,35 @@
 - Tool response 重点字段：
   - `status`
   - `required_confirmations`
+  - `pending_questions`
   - `review.extracted_search_params`
   - `review.current_search_params`
   - `review.missing_fields`
   - `review.suspicious_fields`
   - `review.default_preview`
   - `review.applied_defaults`
+
+## Backend Selection
+
+- 默认执行路径：优先使用 MCP 工具 `run_recruit_pipeline`。
+- 如果当前 AI agent 无法添加新的 MCP、MCP 数量受限、或当前会话拿不到该工具：
+  - 直接切换到 CLI fallback；
+  - 不要放弃流程，也不要要求用户手动把所有步骤重新翻译一遍。
+- CLI fallback 必须调用与 MCP 相同后端的命令：
+  - `boss-recruit-mcp run --instruction "<user request>"`
+- 如果命令行里直接放长文本不稳定，改用文件输入：
+  - `boss-recruit-mcp run --instruction-file <path>`
+- 如果需要传确认信息或覆盖参数，使用这些参数：
+  - `--confirmation-json '<json>'`
+  - `--confirmation-file <path>`
+  - `--overrides-json '<json>'`
+  - `--overrides-file <path>`
+- CLI fallback 的输出是 JSON，字段语义与 MCP 返回保持一致；优先按同一套状态机处理：
+  - `NEED_INPUT`
+  - `NEED_CONFIRMATION`
+  - `COMPLETED`
+  - `FAILED`
+- 当 CLI fallback 可用时，不要再自行拼接搜索 CLI / 筛选 CLI 的底层命令来重建业务逻辑；优先继续复用 `boss-recruit-mcp run`。
 
 ## Confirmation First
 
@@ -99,19 +127,30 @@
 
 1. 收到招聘指令后，先做 setup 检查：
    - MCP 是否可用
+   - 若 MCP 不可用，CLI fallback 是否可用
    - Chrome 调试端口是否已确认
    - Chrome 是否已启动到 Boss 搜索页面
+   - 如果刚启动了新的 Chrome 实例，是否仍停留在 Boss search 页面而未跳转登录
    - `favorite-calibration.json` 是否存在
 2. 若缺少依赖或 MCP 未启动：
    - 自动安装依赖并帮助用户启动 MCP；
    - 优先使用 `npx @reconcrap/boss-recruit-mcp install`
-   - 然后使用用户的 MCP 配置启动 `boss-recruit-mcp`
+   - 然后优先尝试使用用户的 MCP 配置启动 `boss-recruit-mcp`
+   - 如果当前 agent 因平台限制无法配置 MCP，切换到 CLI fallback
 3. 若缺少校准文件：
    - 明确提示用户先完成校准，不要直接调用流水线；
    - 明确给出校准步骤与命令；
    - 明确指出期望生成到哪个路径；
    - 不要在本机搜索并复用其他 `favorite-calibration.json`。
-4. 只有当以上条件满足时，才首次调用 `run_recruit_pipeline`（只传 `instruction`），用于“解析”，不是立刻执行最终搜索结论。
+4. 若 `launch-chrome` 后发现页面没有停留在 search，而是跳到了登录页、首页或其他页面：
+   - 明确告诉用户“当前需要手动登录 Boss”；
+   - 明确要求用户在新打开的 Chrome 窗口中完成登录；
+   - 等用户回复“已登录，可以继续”后，再继续下一步；
+   - 不要在用户未确认登录完成前直接执行搜索、校准或流水线。
+5. 只有当以上条件满足时，才首次进入流水线解析：
+   - 若 MCP 可用，调用 `run_recruit_pipeline`（只传 `instruction`）
+   - 若 MCP 不可用，调用 `boss-recruit-mcp run --instruction ...`
+   - 这一步用于“解析”，不是立刻执行最终搜索结论。
 5. 拿到首次解析结果后，先进入单独的“参数确认对话”：
    - 列出当前已提取到的参数；
    - 单独标出需要用户确认的参数；
@@ -120,8 +159,9 @@
 6. 缺失项常见含义：
    - `city`: 城市，如“杭州”
    - `degree`: 学历，如“本科”“硕士及以上”
-   - `schools`: 学校标签，如“985、211、qs100”
-   - `target_count`: 目标筛选人数，如“10”
+   - `schools`: 学校标签，如“统招本科、双一流院校、985、211、qs100、qs500”
+   - `filter_recent_viewed`: 是否过滤近 14 天内查看过的人选
+   - `target_count`: 目标处理人数，如“10”；表示本轮需要处理多少位候选人，不表示必须有多少人通过
    - `keyword`: 搜索关键词，如“AI infra”“推荐系统”
 7. 若返回 `NEED_INPUT`：
    - 不要只问一次就结束；
@@ -131,8 +171,10 @@
 8. 若返回 `NEED_CONFIRMATION`：
    - 询问用户是否确认 `proposed_keyword`；
    - 同时也要让用户确认其他已提取参数里是否有误；
+   - 若 `required_confirmations` 或 `pending_questions` 里包含 `filter_recent_viewed`，必须明确补问：是否需要过滤近 14 天查看过的人选；
    - 若确认，带 `confirmation.keyword_confirmed=true` 和 `keyword_value` 再次调用；
-   - 若用户修改关键词，传用户给的新词作为 `keyword_value` 再次调用。
+   - 若用户修改关键词，传用户给的新词作为 `keyword_value` 再次调用；
+   - 对“是否过滤近 14 天查看”这个问题，需把用户选择写入 `overrides.filter_recent_viewed=true/false` 再次调用。
 9. 当仍有缺失参数但用户想直接开始时：
    - 先明确告知默认值及风险；
    - 必须得到用户明确确认“可以按默认值继续”后，才能继续执行。
@@ -141,7 +183,10 @@
    - 缺失参数已补齐，或用户已明确接受默认值；
    - `NEED_CONFIRMATION` 分支中的关键词也已确认。
 11. 若返回 `COMPLETED`：
-   - 向用户返回摘要：目标数、已处理、通过数、耗时、输出文件路径。
+   - 向用户返回摘要：目标处理人数、已处理、通过数、耗时、输出文件路径。
+   - 只要状态是 `COMPLETED`，就视为本轮任务完成；
+   - 不要因为 `passed_count < target_count` 就自动重跑；
+   - `target_count` 的含义是“处理人数目标”，不是“通过人数目标”。
 12. 若返回 `FAILED`：
    - 先提炼 `error.code`、`error.message`、`diagnostics`；
    - 如果是 `PIPELINE_PREFLIGHT_FAILED`，明确指出缺失的本地目录 / 文件；
@@ -156,6 +201,9 @@
 - 当用户提到“做过 AI infra / 推荐系统 / 搜索 / 广告 / 多模态”等经历，但没有显式写“关键词”，默认允许流水线先自动抽取，再走确认分支。
 - 当用户附带筛选要求（如“必须发表过 CCF-A 区论文”“有开源项目”“带过团队”），这些要求应该保留在 `criteria` 中，不应被误当作搜索过滤条件。
 - 若参数提取结果出现明显噪声、截断、短语串接、非标准枚举值，优先视为“识别不可靠”，要求用户确认，不要为了推进流程直接采用。
+- 若用户输入 `qs50`、`qs200`、`qs500` 等任意 `QS数字` 学校标签，统一按 `<=100 -> qs100`、`>100 -> qs500` 处理；不要把原始 `QS200` 再传到底层搜索命令。
+- 若用户没有明确提到“是否过滤近 14 天查看过的人选”，必须在参数确认阶段主动补问，不能静默默认开启或关闭。
+- 若用户说“过滤近 14 天查看”“排除最近看过的”，映射为 `filter_recent_viewed=true`；若用户说“不过滤近 14 天查看”“保留最近看过的”，映射为 `filter_recent_viewed=false`。
 - 不要把“用户没有继续回复”解释为“默认同意”；默认值只能在用户明确口头确认后使用。
 - 参数确认对话里，优先采用这种结构：
   - 已识别参数
@@ -176,7 +224,8 @@
 - `已识别参数` 只放当前看起来可信的值，例如：
   - 城市：杭州
   - 学历：本科
-  - 学校标签：985 / 211 / QS100
+  - 学校标签：统招本科 / 双一流院校 / 985 / 211 / QS100 / QS500（按实际需求选择）
+  - 过滤近14天查看：需要 / 不需要
   - 关键词：AI infra
   - 目标人数：10
 - `待确认 / 待修正` 要明确写出“识别值 -> 疑点 -> 需要用户给出的标准值”，例如：
@@ -190,7 +239,7 @@
   - 若继续会使用哪些默认值
   - 会导致搜索范围变宽、相关性下降或结果偏差增大
 - `请用户回复` 要求用户一次性回复完整，优先使用这种收口方式：
-  - 请直接按“城市 / 学历 / 学校标签 / 关键词 / 目标人数”补充或修正
+  - 请直接按“城市 / 学历 / 学校标签 / 是否过滤近14天查看 / 关键词 / 目标人数”补充或修正
   - 如果你接受默认值继续，请明确回复“确认按默认值继续”
 - 若用户补充后仍有缺失，再发第二轮确认时继续复用同一结构，只保留：
   - 已更新的参数
@@ -219,12 +268,13 @@
 - 如果工具返回 `output_csv`，在摘要里给出路径，避免重复解释内部流程。
 - 如果端口还没确认，必须先问用户“是否使用推荐的 `9222`，还是你已经有别的远程调试端口”，不能直接把 `9222` 当成已确认值。
 - 如果需要打开 Chrome，优先帮用户执行而不是只给命令。
+- 如果新打开的 Chrome 页面跳离了 search 页面，必须判断为“需要登录”，提示用户手动登录后再继续。
 
 ## Example
 
 用户：
 
-- “在 Boss 上找做过 AI infra 的候选人，必须发过 CCF-A 区论文，城市杭州，本科，学校 985/211/QS100，目标 10 人”
+- “在 Boss 上找做过 AI infra 的候选人，必须发过 CCF-A 区论文，城市杭州，本科，学校 统招本科/双一流院校/985/211/QS100/QS500 中按需选择，目标 10 人”
 
 期望行为：
 
@@ -245,5 +295,8 @@
 - 参数确认阶段尽量复用统一模板，减少自由表述带来的漏项。
 - 端口未确认时，用“推荐值 + 可选其他端口”的话术，不要直接替用户决定。
 - 校准缺失时，直接指导用户重新校准，不要建议复制或复用任何历史 calibration 文件。
+- 若当前 agent 受 MCP 数量限制，明确告诉用户“本轮改走 CLI fallback”，但用户体验上仍保持同一套确认和状态输出。
+- 新开 Chrome 后若检测到跳转登录，先提示用户手动登录并等待确认，再继续。
+- 若返回 `COMPLETED`，不要把“通过人数不足”理解成“任务未完成”；除非用户明确要求“必须找到 N 个通过人选”，否则不要自动追加新一轮搜索。
 - 若要使用默认值，必须写明“请确认是否按默认值继续”，不能模糊带过。
 - 若运行失败，优先给用户“现在卡在哪一步 + 怎么继续”。

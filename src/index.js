@@ -49,6 +49,7 @@ function createToolSchema() {
           properties: {
             city: { type: "string" },
             degree: { type: "string" },
+            filter_recent_viewed: { type: "boolean" },
             schools: {
               anyOf: [
                 { type: "array", items: { type: "string" } },

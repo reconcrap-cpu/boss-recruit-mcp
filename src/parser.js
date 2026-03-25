@@ -1,7 +1,18 @@
 const SEARCH_SCHOOL_MAP = {
+  "统招": "统招本科",
+  "统招本科": "统招本科",
+  "统招本": "统招本科",
+  "全日制本科": "统招本科",
+  "双一流": "双一流院校",
+  "双一流院校": "双一流院校",
+  "双一流学校": "双一流院校",
   "985": "985院校",
+  "985院校": "985院校",
   "211": "211院校",
-  "qs100": "QS 100"
+  "211院校": "211院校",
+  "qs": "QS 100",
+  "qs100": "QS 100",
+  "qs500": "QS 500"
 };
 const KNOWN_SCHOOL_LABELS = new Set(Object.values(SEARCH_SCHOOL_MAP));
 const DEFAULT_PARAM_VALUES = {
@@ -39,6 +50,13 @@ function normalizeSchoolLabel(value) {
   }
 
   const compact = raw.toLowerCase().replace(/\s+/g, "");
+  const qsMatch = compact.match(/^qs(\d+)$/);
+  if (qsMatch) {
+    const rank = Number.parseInt(qsMatch[1], 10);
+    if (Number.isFinite(rank)) {
+      return rank > 100 ? SEARCH_SCHOOL_MAP.qs500 : SEARCH_SCHOOL_MAP.qs100;
+    }
+  }
   return SEARCH_SCHOOL_MAP[compact] || SEARCH_SCHOOL_MAP[raw] || raw;
 }
 
@@ -79,6 +97,7 @@ function extractCity(text) {
 function extractDegree(text) {
   if (/(博士及以上|博士)/.test(text)) return "博士";
   if (/(硕士及以上|硕士以上)/.test(text)) return "硕士及以上";
+  if (/硕士/.test(text)) return "硕士";
   if (/(本科及以上|本科以上)/.test(text)) return "本科及以上";
   if (/本科/.test(text)) return "本科";
   return null;
@@ -86,10 +105,45 @@ function extractDegree(text) {
 
 function extractSchools(text) {
   const schools = [];
+  if (/统招(?:本科)?/.test(text)) schools.push(SEARCH_SCHOOL_MAP["统招"]);
+  if (/双一流(?:院校|学校)?/.test(text)) schools.push(SEARCH_SCHOOL_MAP["双一流"]);
   if (/(^|[^0-9])985([^0-9]|$)/.test(text)) schools.push(SEARCH_SCHOOL_MAP["985"]);
   if (/(^|[^0-9])211([^0-9]|$)/.test(text)) schools.push(SEARCH_SCHOOL_MAP["211"]);
-  if (/(qs\s*100|QS\s*100|qs100|QS100)/.test(text)) schools.push(SEARCH_SCHOOL_MAP["qs100"]);
+  const qsMatches = text.matchAll(/\bqs\s*(\d+)\b/ig);
+  for (const match of qsMatches) {
+    const rank = Number.parseInt(match[1], 10);
+    if (Number.isFinite(rank)) {
+      schools.push(rank > 100 ? SEARCH_SCHOOL_MAP.qs500 : SEARCH_SCHOOL_MAP.qs100);
+    }
+  }
   return uniqueList(schools);
+}
+
+function extractRecentViewedFilter(text) {
+  const negativePatterns = [
+    /(?:不|别|无需|不用|不要).{0,6}(?:过滤|排除|去掉|剔除).{0,8}(?:近?14天(?:内)?查看(?:过)?)/i,
+    /(?:保留|包含).{0,8}(?:近?14天(?:内)?查看(?:过)?)/i,
+    /(?:近?14天(?:内)?查看(?:过)?).{0,8}(?:不要|不用|无需|不需要|不必).{0,4}(?:过滤|排除|去掉|剔除)/i
+  ];
+
+  for (const pattern of negativePatterns) {
+    if (pattern.test(text)) {
+      return false;
+    }
+  }
+
+  const positivePatterns = [
+    /(?:过滤|排除|去掉|剔除).{0,8}(?:近?14天(?:内)?查看(?:过)?)/i,
+    /(?:近?14天(?:内)?查看(?:过)?).{0,8}(?:过滤|排除|去掉|剔除)/i
+  ];
+
+  for (const pattern of positivePatterns) {
+    if (pattern.test(text)) {
+      return true;
+    }
+  }
+
+  return null;
 }
 
 function normalizeStringOverride(value) {
@@ -173,6 +227,10 @@ function sanitizeClause(clause) {
     .trim();
 }
 
+function isCountPlanningClause(clause) {
+  return /(?:目标(?:筛选)?(?:人数|数量)?|至少筛选|筛选\s*\d+\s*位|输出\s*\d+\s*(?:位|个|个人选|个候选人)?|最终输出\s*\d+\s*(?:位|个|个人选|个候选人)?|处理\s*\d+\s*(?:位|人)|(?:浏览|拉取|抓取).*(?:至少\s*)?\d+\s*(?:位|个|个人选|个候选人)?|最匹配.*\d+\s*(?:位|个|个人选|个候选人)?)/i.test(clause);
+}
+
 function buildScreenCriteria(text, searchParams) {
   const clauses = text
     .split(/[，,。；;\n]/)
@@ -183,8 +241,9 @@ function buildScreenCriteria(text, searchParams) {
     if (/搜索关键词|关键词|keyword/i.test(clause)) return false;
     if (/地点|城市/.test(clause)) return false;
     if (/学历|本科|硕士|博士/.test(clause) && !/论文|项目|经验/.test(clause)) return false;
-    if (/985|211|qs\s*100|QS\s*100|院校/.test(clause) && !/论文|经验|项目/.test(clause)) return false;
-    if (/至少筛选|目标人数|目标数量|筛选\d+位/.test(clause)) return false;
+    if (/985|211|qs\s*\d+|双一流|统招(?:本科)?|院校/i.test(clause) && !/论文|经验|项目/.test(clause)) return false;
+    if (/近?14天(?:内)?查看(?:过)?|过滤近14天查看/.test(clause)) return false;
+    if (isCountPlanningClause(clause)) return false;
     return true;
   });
 
@@ -342,6 +401,7 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
     city: extractCity(text),
     degree: extractDegree(text),
     schools: extractSchools(text),
+    filter_recent_viewed: extractRecentViewedFilter(text),
     keyword_explicit: extractKeywordExplicit(text),
     keyword_auto: extractKeywordAuto(text),
     target_count: extractTargetCount(text)
@@ -352,11 +412,15 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
     const overrideDegree = normalizeStringOverride(overrides.degree);
     const overrideSchools = normalizeSchoolsOverride(overrides.schools);
     const overrideKeyword = normalizeStringOverride(overrides.keyword);
+    const overrideRecentViewed = typeof overrides.filter_recent_viewed === "boolean"
+      ? overrides.filter_recent_viewed
+      : null;
 
     if (overrideCity) parsed.city = overrideCity;
     if (overrideDegree) parsed.degree = overrideDegree;
     if (overrideSchools && overrideSchools.length > 0) parsed.schools = overrideSchools;
     if (overrideKeyword) parsed.keyword_override = overrideKeyword;
+    if (overrideRecentViewed !== null) parsed.filter_recent_viewed = overrideRecentViewed;
 
     if (Number.isFinite(overrides.target_count) && overrides.target_count > 0) {
       parsed.target_count = Number.parseInt(String(overrides.target_count), 10);
@@ -368,6 +432,7 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
     city: parsed.city,
     degree: parsed.degree,
     schools: parsed.schools,
+    filter_recent_viewed: parsed.filter_recent_viewed,
     keyword: keywordResolution.keyword
   };
 
@@ -394,6 +459,19 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
     { skipKeywordDefault }
   );
   const suspicious_fields = collectSuspiciousFields(searchParams, screenParams);
+  const needs_recent_viewed_filter_confirmation = searchParams.filter_recent_viewed === null;
+  const pending_questions = needs_recent_viewed_filter_confirmation
+    ? [
+      {
+        field: "filter_recent_viewed",
+        question: "是否需要过滤近14天查看过的人选？",
+        options: [
+          { label: "需要过滤", value: true },
+          { label: "不过滤", value: false }
+        ]
+      }
+    ]
+    : [];
 
   return {
     parsed,
@@ -403,8 +481,10 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
     has_unresolved_missing_fields: missingBeforeDefaults.length > 0 && !useDefaultForMissing,
     suspicious_fields,
     needs_keyword_confirmation: keywordResolution.needsConfirmation,
+    needs_recent_viewed_filter_confirmation,
     needs_search_params_confirmation: confirmation?.search_params_confirmed !== true,
     proposed_keyword: keywordResolution.proposedKeyword,
+    pending_questions,
     default_preview: defaultPreview,
     applied_defaults: appliedDefaults,
     review: {
@@ -415,6 +495,7 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
       missing_fields: missingBeforeDefaults,
       has_unresolved_missing_fields: missingBeforeDefaults.length > 0 && !useDefaultForMissing,
       suspicious_fields,
+      pending_questions,
       default_preview: defaultPreview,
       applied_defaults: appliedDefaults
     }

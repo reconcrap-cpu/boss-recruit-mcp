@@ -1233,7 +1233,7 @@ async function main() {
     while (processedCount < targetCount) {
         console.log('');
         console.log('----------------------------------------');
-        console.log(`处理进度: ${processedCount}/${targetCount} 已通过 ${passedCandidates.length} 人 未确认收藏 ${uncertainFavoriteCount} 人`);
+        console.log(`处理进度: 已处理 ${processedCount}/${targetCount}（目标处理人数） 已通过 ${passedCandidates.length} 人 未确认收藏 ${uncertainFavoriteCount} 人`);
 
         const processedKeysArray = Array.from(processedCardKeys);
         const findCardExpr = jsFindNextUnprocessedCard + '(' + currentCardIndex + ',' + JSON.stringify(processedKeysArray) + ')';
@@ -1606,7 +1606,7 @@ async function main() {
         }
 
         if (processedCount >= targetCount * 3) {
-            console.log('警告: 已处理超过目标数量3倍，强制结束');
+            console.log('警告: 已处理超过目标处理人数3倍，强制结束');
             break;
         }
     }
@@ -1636,7 +1636,8 @@ async function main() {
     console.log('处理结果:');
     console.log(`  已处理: ${processedCount} 人`);
     console.log(`  通过筛选: ${passedCandidates.length} 人`);
-    console.log(`  目标人数: ${targetCount} 人`);
+    console.log(`  目标处理人数: ${targetCount} 人`);
+    console.log(`  完成条件: 已处理人数达到目标处理人数；不要求通过人数达到该值`);
     console.log('');
     console.log('Done.');
 }

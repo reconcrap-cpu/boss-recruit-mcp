@@ -157,7 +157,7 @@ function parseSearchCount(output) {
 function parseScreenSummary(output) {
   const processed = output.match(/已处理:\s*(\d+)\s*人/);
   const passed = output.match(/通过筛选:\s*(\d+)\s*人/);
-  const target = output.match(/目标人数:\s*(\d+)\s*人/);
+  const target = output.match(/目标(?:处理)?人数:\s*(\d+)\s*人/);
   const csv = output.match(/结果已导出到:\s*(.+)/);
 
   return {
@@ -298,6 +298,10 @@ export async function runSearchCli({ workspaceRoot, searchParams }) {
     "--port",
     String(debugPort)
   ];
+
+  if (typeof searchParams.filter_recent_viewed === "boolean") {
+    args.push("--filter-recent-viewed", String(searchParams.filter_recent_viewed));
+  }
 
   const result = await runProcess({
     command: "node",

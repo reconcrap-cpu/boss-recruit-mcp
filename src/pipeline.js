@@ -10,6 +10,9 @@ function buildRequiredConfirmations(parsedResult) {
   if (parsedResult.needs_keyword_confirmation) {
     confirmations.push("keyword");
   }
+  if (parsedResult.needs_recent_viewed_filter_confirmation) {
+    confirmations.push("filter_recent_viewed");
+  }
   if (parsedResult.has_unresolved_missing_fields) {
     confirmations.push("missing_fields_or_defaults");
   }
@@ -25,6 +28,7 @@ function buildNeedInputResponse(parsedResult) {
     required_confirmations: buildRequiredConfirmations(parsedResult),
     search_params: parsedResult.searchParams,
     screen_params: parsedResult.screenParams,
+    pending_questions: parsedResult.pending_questions,
     review: parsedResult.review,
     error: {
       code: "MISSING_REQUIRED_FIELDS",
@@ -44,6 +48,7 @@ function buildNeedConfirmationResponse(parsedResult) {
       keyword: parsedResult.proposed_keyword || parsedResult.searchParams.keyword
     },
     screen_params: parsedResult.screenParams,
+    pending_questions: parsedResult.pending_questions,
     review: parsedResult.review
   };
 }
@@ -146,7 +151,11 @@ export async function runRecruitPipeline({
     return buildNeedInputResponse(parsed);
   }
 
-  if (parsed.needs_keyword_confirmation || parsed.needs_search_params_confirmation) {
+  if (
+    parsed.needs_keyword_confirmation
+    || parsed.needs_search_params_confirmation
+    || parsed.needs_recent_viewed_filter_confirmation
+  ) {
     return buildNeedConfirmationResponse(parsed);
   }
 
@@ -237,7 +246,10 @@ export async function runRecruitPipeline({
       processed_count: summary.processed_count ?? null,
       passed_count: summary.passed_count ?? null,
       duration_sec: durationSec,
-      output_csv: summary.output_csv
-    }
+      output_csv: summary.output_csv,
+      completion_reason: "processed_target_reached",
+      target_count_semantics: "target_count means processed candidate count, not passed candidate count"
+    },
+    message: "流水线已完成。target_count 表示处理人数目标，而不是通过人数目标；即使通过人数小于 target_count，只要已处理达到目标人数，也应视为本轮完成。"
   };
 }

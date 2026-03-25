@@ -7,6 +7,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { startServer } from "./index.js";
 import { runPipelinePreflight } from "./adapters.js";
+import { runRecruitPipeline } from "./pipeline.js";
 
 const require = createRequire(import.meta.url);
 const currentFilePath = fileURLToPath(import.meta.url);
@@ -20,6 +21,10 @@ const calibrationScriptPath = path.join(
   "calibrate-favorite-position-v2.cjs"
 );
 const bossUrl = "https://www.zhipin.com/web/chat/search";
+const SUPPORTED_MCP_CLIENTS = ["generic", "cursor", "trae", "claudecode", "openclaw"];
+const DEFAULT_MCP_SERVER_NAME = "boss-recruit";
+const DEFAULT_MCP_COMMAND = "npx";
+const DEFAULT_MCP_ARGS = ["-y", "@reconcrap/boss-recruit-mcp@latest", "start"];
 
 function getCodexHome() {
   return process.env.CODEX_HOME
@@ -43,6 +48,15 @@ function getUserCalibrationPath() {
   return path.join(getCodexHome(), "boss-recruit-mcp", "favorite-calibration.json");
 }
 
+function getChromeUserDataDir(port, options = {}) {
+  const rawProvided = options.userDataDir ?? options["user-data-dir"];
+  const provided = typeof rawProvided === "string" ? rawProvided.trim() : "";
+  const basePath = provided || path.join(getCodexHome(), "boss-recruit-mcp", `chrome-profile-${port}`);
+  const targetPath = path.resolve(basePath);
+  ensureDir(targetPath);
+  return targetPath;
+}
+
 function parseOptions(args) {
   const options = {};
   for (let i = 0; i < args.length; i++) {
@@ -58,6 +72,277 @@ function parseOptions(args) {
     }
   }
   return options;
+}
+
+function parseJsonObjectOption(value, label) {
+  if (value === undefined || value === null || value === "") {
+    return {};
+  }
+  const parsed = parseJsonOption(value, label);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${label} must be a JSON object`);
+  }
+  return parsed;
+}
+
+function parseStringArrayOption(value, label) {
+  if (value === undefined || value === null || value === "") {
+    return [];
+  }
+  const parsed = parseJsonOption(value, label);
+  if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string")) {
+    throw new Error(`${label} must be a JSON string array`);
+  }
+  return parsed;
+}
+
+function normalizeMcpClientName(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "";
+  if (raw === "claude-code") return "claudecode";
+  return raw;
+}
+
+function parseMcpClientTargets(rawValue) {
+  if (!rawValue) return SUPPORTED_MCP_CLIENTS.slice();
+  const raw = String(rawValue).trim().toLowerCase();
+  if (!raw || raw === "all") {
+    return SUPPORTED_MCP_CLIENTS.slice();
+  }
+  const candidates = raw
+    .split(",")
+    .map((item) => normalizeMcpClientName(item))
+    .filter(Boolean);
+  const unique = [...new Set(candidates)];
+  const invalid = unique.filter((item) => !SUPPORTED_MCP_CLIENTS.includes(item));
+  if (invalid.length) {
+    throw new Error(
+      `Unsupported --client value: ${invalid.join(", ")}. Supported: ${SUPPORTED_MCP_CLIENTS.join(", ")}`
+    );
+  }
+  return unique;
+}
+
+function getAgentConfigOutputDir(options = {}) {
+  if (typeof options["output-dir"] === "string" && options["output-dir"].trim()) {
+    return path.resolve(options["output-dir"]);
+  }
+  return path.join(getCodexHome(), "boss-recruit-mcp", "agent-mcp-configs");
+}
+
+function buildMcpLaunchConfig(options = {}) {
+  const command =
+    typeof options.command === "string" && options.command.trim()
+      ? options.command.trim()
+      : DEFAULT_MCP_COMMAND;
+  const args = parseStringArrayOption(options["args-json"], "args-json");
+  const env = parseJsonObjectOption(options["env-json"], "env-json");
+  const launchArgs = args.length
+    ? args
+    : command === "boss-recruit-mcp"
+      ? ["start"]
+      : DEFAULT_MCP_ARGS.slice();
+  const launchConfig = {
+    command,
+    args: launchArgs
+  };
+  if (Object.keys(env).length > 0) {
+    launchConfig.env = env;
+  }
+  return launchConfig;
+}
+
+function buildMcpConfigFileContent(options = {}) {
+  const serverName =
+    typeof options["server-name"] === "string" && options["server-name"].trim()
+      ? options["server-name"].trim()
+      : DEFAULT_MCP_SERVER_NAME;
+  return {
+    mcpServers: {
+      [serverName]: buildMcpLaunchConfig(options)
+    }
+  };
+}
+
+function writeMcpConfigFiles(options = {}) {
+  const clients = parseMcpClientTargets(options.client);
+  const outputDir = getAgentConfigOutputDir(options);
+  ensureDir(outputDir);
+  const files = [];
+
+  for (const client of clients) {
+    const filePath = path.join(outputDir, `mcp.${client}.json`);
+    const content = buildMcpConfigFileContent(options);
+    fs.writeFileSync(filePath, JSON.stringify(content, null, 2), "utf8");
+    files.push({ client, file: filePath });
+  }
+
+  return { outputDir, files };
+}
+
+function readTextFile(filePath, label) {
+  const resolved = path.resolve(String(filePath));
+  try {
+    return fs.readFileSync(resolved, "utf8");
+  } catch (error) {
+    throw new Error(`Failed to read ${label} file: ${resolved}. ${error.message}`);
+  }
+}
+
+function parseJsonOption(value, label) {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(String(value));
+  } catch (error) {
+    throw new Error(`Invalid ${label} JSON: ${error.message}`);
+  }
+}
+
+function getRunInstruction(options) {
+  if (typeof options.instruction === "string" && options.instruction.trim()) {
+    return options.instruction.trim();
+  }
+
+  const instructionFile = options["instruction-file"];
+  if (typeof instructionFile === "string" && instructionFile.trim()) {
+    return readTextFile(instructionFile, "instruction").trim();
+  }
+
+  throw new Error("Missing required --instruction or --instruction-file");
+}
+
+function getRunConfirmation(options) {
+  if (typeof options["confirmation-file"] === "string" && options["confirmation-file"].trim()) {
+    return parseJsonOption(
+      readTextFile(options["confirmation-file"], "confirmation"),
+      "confirmation"
+    );
+  }
+
+  return parseJsonOption(options["confirmation-json"], "confirmation");
+}
+
+function getRunOverrides(options) {
+  if (typeof options["overrides-file"] === "string" && options["overrides-file"].trim()) {
+    return parseJsonOption(
+      readTextFile(options["overrides-file"], "overrides"),
+      "overrides"
+    );
+  }
+
+  return parseJsonOption(options["overrides-json"], "overrides");
+}
+
+function getWorkspaceRoot(options) {
+  const raw = options["workspace-root"] || process.env.BOSS_WORKSPACE_ROOT || process.cwd();
+  return path.resolve(String(raw));
+}
+
+function printJson(value) {
+  console.log(JSON.stringify(value, null, 2));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function listChromeTabs(port) {
+  const response = await fetch(`http://127.0.0.1:${port}/json/list`);
+  if (!response.ok) {
+    throw new Error(`DevTools endpoint returned ${response.status}`);
+  }
+  const data = await response.json();
+  return Array.isArray(data) ? data : [];
+}
+
+function buildBossPageState(payload) {
+  return {
+    key: "boss_page_state",
+    ...payload
+  };
+}
+
+async function inspectBossPageState(port, options = {}) {
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 8000;
+  const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : 1000;
+  const expectedUrl = options.expectedUrl || bossUrl;
+  const deadline = Date.now() + timeoutMs;
+  let lastError = null;
+  let lastTabs = [];
+
+  while (Date.now() < deadline) {
+    try {
+      const tabs = await listChromeTabs(port);
+      lastTabs = tabs;
+
+      const exactSearchTab = tabs.find(
+        (tab) => typeof tab?.url === "string" && tab.url.includes("/web/chat/search")
+      );
+      if (exactSearchTab) {
+        return buildBossPageState({
+          ok: true,
+          state: "SEARCH_READY",
+          path: exactSearchTab.url,
+          current_url: exactSearchTab.url,
+          title: exactSearchTab.title || null,
+          requires_login: false,
+          message: "Boss 搜索页已打开，且当前仍停留在 search 页面。"
+        });
+      }
+
+      const bossTab = tabs.find(
+        (tab) => typeof tab?.url === "string" && tab.url.includes("zhipin.com")
+      );
+      if (bossTab) {
+        return buildBossPageState({
+          ok: false,
+          state: "LOGIN_REQUIRED",
+          path: bossTab.url,
+          current_url: bossTab.url,
+          title: bossTab.title || null,
+          requires_login: true,
+          expected_url: expectedUrl,
+          message: "Boss 页面没有停留在 search 页面，通常表示需要重新登录。请用户手动登录 Boss 后再继续。"
+        });
+      }
+    } catch (error) {
+      lastError = error;
+    }
+
+    await sleep(pollMs);
+  }
+
+  if (lastError) {
+    return buildBossPageState({
+      ok: false,
+      state: "DEBUG_PORT_UNREACHABLE",
+      path: `http://127.0.0.1:${port}`,
+      current_url: null,
+      title: null,
+      requires_login: false,
+      expected_url: expectedUrl,
+      message: `无法连接到 Chrome DevTools 端口 ${port}。请确认 Chrome 已以远程调试模式启动。`,
+      error: lastError.message
+    });
+  }
+
+  return buildBossPageState({
+    ok: false,
+    state: "BOSS_TAB_NOT_FOUND",
+    path: expectedUrl,
+    current_url: null,
+    title: null,
+    requires_login: false,
+    expected_url: expectedUrl,
+    message: "未检测到 Boss 页面标签页。请确认 Chrome 已打开 Boss 搜索页。",
+    sample_urls: lastTabs
+      .map((tab) => tab?.url)
+      .filter(Boolean)
+      .slice(0, 5)
+  });
 }
 
 function hasModule(moduleName) {
@@ -120,9 +405,10 @@ function ensureUserConfig() {
   return { path: targetPath, created: false };
 }
 
-function printDoctor(options) {
+async function printDoctor(options) {
   const port = getDebugPort(options);
   const checks = runPipelinePreflight(process.cwd()).checks.slice();
+  const pageState = await inspectBossPageState(port, { timeoutMs: 2000, pollMs: 500 });
   const userConfigPath = getUserConfigPath();
   checks.push({
     key: "user_config",
@@ -150,10 +436,14 @@ function printDoctor(options) {
   });
   checks.push({
     key: "chrome_debug_port",
-    ok: true,
+    ok: pageState.state !== "DEBUG_PORT_UNREACHABLE",
     path: `http://localhost:${port}`,
-    message: `建议使用 Chrome 调试端口 ${port}`
+    message:
+      pageState.state === "DEBUG_PORT_UNREACHABLE"
+        ? `无法连接 Chrome 调试端口 ${port}`
+        : `Chrome 调试端口 ${port} 可连接`
   });
+  checks.push(pageState);
   console.log(JSON.stringify({ ok: checks.every((item) => item.ok), port, checks }, null, 2));
 }
 
@@ -176,7 +466,7 @@ async function calibrate(options) {
   process.exitCode = code;
 }
 
-function launchChrome(options) {
+async function launchChrome(options) {
   const chromePath = getChromeExecutable();
   if (!chromePath) {
     console.error("Chrome executable not found. Set BOSS_RECRUIT_CHROME_PATH or install Google Chrome.");
@@ -184,8 +474,10 @@ function launchChrome(options) {
     return;
   }
   const port = getDebugPort(options);
+  const userDataDir = getChromeUserDataDir(port, options);
   const args = [
     `--remote-debugging-port=${port}`,
+    `--user-data-dir=${userDataDir}`,
     "--new-window",
     bossUrl
   ];
@@ -196,7 +488,27 @@ function launchChrome(options) {
   });
   child.unref();
   console.log(`Chrome launched with remote debugging port ${port}`);
+  console.log(`User data dir: ${userDataDir}`);
   console.log(`URL: ${bossUrl}`);
+
+  const pageState = await inspectBossPageState(port, { timeoutMs: 12000, pollMs: 1000 });
+  if (pageState.state === "SEARCH_READY") {
+    console.log("Boss search page is ready.");
+    console.log(`Current URL: ${pageState.current_url}`);
+    return;
+  }
+
+  if (pageState.state === "LOGIN_REQUIRED") {
+    console.log("Boss page redirected away from search. Manual login is required.");
+    console.log(`Current URL: ${pageState.current_url}`);
+    console.log("Please log in to Boss manually in the opened Chrome window, then tell the AI agent to continue.");
+    return;
+  }
+
+  console.log(pageState.message);
+  if (pageState.current_url) {
+    console.log(`Current URL: ${pageState.current_url}`);
+  }
 }
 
 function printHelp() {
@@ -205,13 +517,24 @@ function printHelp() {
   console.log("Usage:");
   console.log("  boss-recruit-mcp              Start the MCP server");
   console.log("  boss-recruit-mcp start        Start the MCP server");
+  console.log("  boss-recruit-mcp run          Run the pipeline once via CLI and print JSON");
   console.log("  boss-recruit-mcp install      Install Codex skill and initialize user config");
   console.log("  boss-recruit-mcp install-skill Install only the Codex skill");
   console.log("  boss-recruit-mcp init-config  Create ~/.codex/boss-recruit-mcp/screening-config.json if missing");
+  console.log("  boss-recruit-mcp mcp-config   Generate MCP config JSON for Cursor/Trae/Claude Code/OpenClaw");
   console.log("  boss-recruit-mcp doctor       Check config, calibration, and runtime prerequisites");
   console.log("  boss-recruit-mcp calibrate    Run favorite-button calibration and save favorite-calibration.json");
-  console.log("  boss-recruit-mcp launch-chrome Launch Chrome in remote-debugging mode and open Boss search");
+  console.log("  boss-recruit-mcp launch-chrome Launch Chrome in remote-debugging mode, open Boss search, and check login state");
   console.log("  boss-recruit-mcp where        Print installed package, skill, and config paths");
+  console.log("");
+  console.log("Run command:");
+  console.log("  boss-recruit-mcp run --instruction \"找杭州本科做过推荐系统的人\" [--confirmation-json '{...}'] [--overrides-json '{...}']");
+  console.log("  boss-recruit-mcp run --instruction-file request.txt [--confirmation-file confirmation.json] [--overrides-file overrides.json]");
+  console.log("");
+  console.log("MCP config command:");
+  console.log("  boss-recruit-mcp mcp-config --client cursor");
+  console.log("  boss-recruit-mcp mcp-config --client all --output-dir <dir>");
+  console.log("  boss-recruit-mcp mcp-config --client generic --command boss-recruit-mcp --args-json '[\"start\"]'");
 }
 
 function printPaths() {
@@ -225,23 +548,64 @@ function printPaths() {
   console.log(`desktop_output_default=${getDesktopDir()}`);
 }
 
+function printMcpConfig(options = {}) {
+  const clients = parseMcpClientTargets(options.client);
+  if (clients.length === 1 && !options["output-dir"]) {
+    const config = buildMcpConfigFileContent(options);
+    printJson(config);
+    return;
+  }
+
+  const result = writeMcpConfigFiles(options);
+  console.log(`MCP config templates exported to: ${result.outputDir}`);
+  for (const item of result.files) {
+    console.log(`- ${item.client}: ${item.file}`);
+  }
+  console.log("");
+  console.log("Tip:");
+  console.log("1. Choose the template file matching your AI client.");
+  console.log("2. Merge its mcpServers block into that client's MCP config.");
+}
+
 function installAll() {
   const skillTarget = installSkill();
   const configResult = ensureUserConfig();
+  const mcpTemplateResult = writeMcpConfigFiles({ client: "all" });
   console.log(`Skill installed to: ${skillTarget}`);
   if (configResult.created) {
     console.log(`Config template created at: ${configResult.path}`);
   } else {
     console.log(`Config already exists at: ${configResult.path}`);
   }
+  console.log(`MCP config templates exported to: ${mcpTemplateResult.outputDir}`);
+  for (const item of mcpTemplateResult.files) {
+    console.log(`- ${item.client}: ${item.file}`);
+  }
   console.log("");
   console.log("Next steps:");
   console.log("1. Fill in baseUrl/apiKey/model in the config file above.");
-  console.log("2. Choose a Chrome remote-debugging port (9222 is recommended, but you can reuse an existing port).");
-  console.log("3. Run `boss-recruit-mcp doctor --port <your-port>` to verify config, calibration, and runtime prerequisites.");
-  console.log("4. Run `boss-recruit-mcp launch-chrome --port <your-port>` and log in to Boss if needed.");
-  console.log("5. Run `boss-recruit-mcp calibrate --port <your-port>` to generate favorite-calibration.json for this environment.");
-  console.log("6. Run `boss-recruit-mcp start` or configure your MCP client to launch `boss-recruit-mcp`.");
+  console.log("2. Choose a client template from the exported MCP config files and merge it into your AI client config.");
+  console.log("3. Choose a Chrome remote-debugging port (9222 is recommended, but you can reuse an existing port).");
+  console.log("4. Run `boss-recruit-mcp doctor --port <your-port>` to verify config, calibration, and runtime prerequisites.");
+  console.log("5. Run `boss-recruit-mcp launch-chrome --port <your-port>`; if it reports the page redirected away from search, log in to Boss manually in that Chrome window.");
+  console.log("6. Run `boss-recruit-mcp calibrate --port <your-port>` to generate favorite-calibration.json for this environment.");
+  console.log("7. Run `boss-recruit-mcp start` or configure your MCP client to launch the command from the generated template.");
+}
+
+async function runPipelineOnce(options) {
+  const instruction = getRunInstruction(options);
+  const confirmation = getRunConfirmation(options);
+  const overrides = getRunOverrides(options);
+  const workspaceRoot = getWorkspaceRoot(options);
+
+  const result = await runRecruitPipeline({
+    workspaceRoot,
+    instruction,
+    confirmation,
+    overrides
+  });
+
+  printJson(result);
 }
 
 const command = process.argv[2] || "start";
@@ -250,6 +614,21 @@ const options = parseOptions(process.argv.slice(3));
 switch (command) {
   case "start":
     startServer();
+    break;
+  case "run":
+    try {
+      await runPipelineOnce(options);
+    } catch (error) {
+      printJson({
+        status: "FAILED",
+        error: {
+          code: "INVALID_CLI_INPUT",
+          message: error.message || "Invalid CLI input",
+          retryable: false
+        }
+      });
+      process.exitCode = 1;
+    }
     break;
   case "install":
     installAll();
@@ -266,14 +645,22 @@ switch (command) {
     );
     break;
   }
+  case "mcp-config":
+    try {
+      printMcpConfig(options);
+    } catch (error) {
+      console.error(error.message || "Failed to generate MCP config template.");
+      process.exitCode = 1;
+    }
+    break;
   case "doctor":
-    printDoctor(options);
+    await printDoctor(options);
     break;
   case "calibrate":
     await calibrate(options);
     break;
   case "launch-chrome":
-    launchChrome(options);
+    await launchChrome(options);
     break;
   case "where":
     printPaths();

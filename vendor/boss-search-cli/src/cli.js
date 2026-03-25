@@ -54,6 +54,7 @@ class BossSearchCLI {
       degree: '不限',
       schools: [],
       city: null,
+      filterRecentViewed: null,
       port: 9222,
       experience: '不限',
       ageMin: null,
@@ -62,13 +63,48 @@ class BossSearchCLI {
 
     const schoolMap = {
       '211': '211院校',
+      '211院校': '211院校',
       '985': '985院校',
+      '985院校': '985院校',
+      'qs': 'QS 100',
       'qs100': 'QS 100',
       'qs500': 'QS 500',
       '双一流': '双一流院校',
+      '双一流院校': '双一流院校',
+      '双一流学校': '双一流院校',
       '留学生': '留学生',
-      '统招': '统招本科'
+      '统招': '统招本科',
+      '统招本科': '统招本科',
+      '统招本': '统招本科',
+      '全日制本科': '统招本科'
     };
+
+    function resolveQsSchool(normalizedSchool) {
+      const matched = normalizedSchool.match(/^qs(\d+)$/);
+      if (!matched) return null;
+
+      const rank = Number.parseInt(matched[1], 10);
+      if (!Number.isFinite(rank)) return null;
+
+      return rank > 100 ? 'QS 500' : 'QS 100';
+    }
+
+    function normalizeSchool(rawSchool) {
+      const raw = String(rawSchool || '').trim();
+      if (!raw) return raw;
+      const normalized = raw.toLowerCase().replace(/\s+/g, '');
+      const qsSchool = resolveQsSchool(normalized);
+      if (qsSchool) return qsSchool;
+      return schoolMap[normalized] || schoolMap[raw] || raw;
+    }
+
+    function parseBooleanArg(rawValue) {
+      const normalized = String(rawValue || '').trim().toLowerCase();
+      if (!normalized) return null;
+      if (['true', '1', 'yes', 'y', 'on', '是', '要', '需要', '过滤'].includes(normalized)) return true;
+      if (['false', '0', 'no', 'n', 'off', '否', '不要', '不需要', '不过滤'].includes(normalized)) return false;
+      return null;
+    }
 
     const argv = process.argv.slice(2);
     for (let i = 0; i < argv.length; i++) {
@@ -78,13 +114,12 @@ class BossSearchCLI {
       } else if (arg === '--degree' || arg === '-d') {
         args.degree = argv[++i];
       } else if (arg === '--schools' || arg === '-s') {
-        const schools = argv[++i].split(',');
-        args.schools = schools.map(function(s) {
-          const normalized = s.trim().toLowerCase();
-          return schoolMap[normalized] || s;
-        });
+        const schools = String(argv[++i] || '').split(/[，,]/);
+        args.schools = Array.from(new Set(schools.map(normalizeSchool).filter(Boolean)));
       } else if (arg === '--city' || arg === '-c') {
         args.city = argv[++i];
+      } else if (arg === '--filter-recent-viewed') {
+        args.filterRecentViewed = parseBooleanArg(argv[++i]);
       } else if (arg === '--port' || arg === '-p') {
         const port = Number.parseInt(argv[++i], 10);
         if (Number.isFinite(port) && port > 0) {
@@ -108,6 +143,9 @@ class BossSearchCLI {
     if (config.schools.length > 0) {
       console.log('  院校要求:', config.schools.join(', '));
     }
+    if (typeof config.filterRecentViewed === 'boolean') {
+      console.log('  过滤近14天查看:', config.filterRecentViewed ? '是' : '否');
+    }
     console.log('');
 
     await this.searcher.sleep(500);
@@ -127,6 +165,11 @@ class BossSearchCLI {
     }
 
     await this.searcher.clickSearch();
+
+    if (config.filterRecentViewed) {
+      await this.searcher.setRecentViewedFilter(true);
+    }
+
     await this.searcher.sleep(2000);
     await this.searcher.getResults();
 

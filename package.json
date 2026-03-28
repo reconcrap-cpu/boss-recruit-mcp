@@ -1,6 +1,6 @@
 {
   "name": "@reconcrap/boss-recruit-mcp",
-  "version": "1.0.11",
+  "version": "1.0.12",
   "description": "Unified MCP pipeline for boss-search-cli and boss-screen-cli",
   "keywords": [
     "boss",

@@ -23,6 +23,7 @@ const calibrationScriptPath = path.join(
   "calibrate-favorite-position-v2.cjs"
 );
 const bossUrl = "https://www.zhipin.com/web/chat/search";
+const CHROME_ONBOARDING_URL_PATTERN = /^chrome:\/\/(welcome|intro|newtab|signin|history-sync|settings\/syncSetup)/i;
 const SUPPORTED_MCP_CLIENTS = ["generic", "cursor", "trae", "claudecode", "openclaw"];
 const DEFAULT_MCP_SERVER_NAME = "boss-recruit";
 const DEFAULT_MCP_COMMAND = "npx";
@@ -450,6 +451,22 @@ function buildBossPageState(payload) {
   };
 }
 
+function extractSampleUrls(tabs, limit = 5) {
+  return tabs
+    .map((tab) => tab?.url)
+    .filter(Boolean)
+    .slice(0, limit);
+}
+
+function findChromeOnboardingUrl(tabs) {
+  for (const tab of tabs) {
+    if (typeof tab?.url === "string" && CHROME_ONBOARDING_URL_PATTERN.test(tab.url)) {
+      return tab.url;
+    }
+  }
+  return null;
+}
+
 async function inspectBossPageState(port, options = {}) {
   const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 8000;
   const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : 1000;
@@ -514,6 +531,21 @@ async function inspectBossPageState(port, options = {}) {
     });
   }
 
+  const onboardingUrl = findChromeOnboardingUrl(lastTabs);
+  if (onboardingUrl) {
+    return buildBossPageState({
+      ok: false,
+      state: "CHROME_ONBOARDING_INTERCEPTED",
+      path: onboardingUrl,
+      current_url: onboardingUrl,
+      title: null,
+      requires_login: false,
+      expected_url: expectedUrl,
+      message: "Chrome 当前停留在登录/引导页，正在尝试自动拉回 Boss 搜索页。",
+      sample_urls: extractSampleUrls(lastTabs)
+    });
+  }
+
   return buildBossPageState({
     ok: false,
     state: "BOSS_TAB_NOT_FOUND",
@@ -523,10 +555,7 @@ async function inspectBossPageState(port, options = {}) {
     requires_login: false,
     expected_url: expectedUrl,
     message: "未检测到 Boss 页面标签页。请确认 Chrome 已打开 Boss 搜索页。",
-    sample_urls: lastTabs
-      .map((tab) => tab?.url)
-      .filter(Boolean)
-      .slice(0, 5)
+    sample_urls: extractSampleUrls(lastTabs)
   });
 }
 
@@ -551,6 +580,43 @@ async function openBossSearchTab(port) {
     ok: false,
     error: lastError?.message || "Failed to open Boss search tab via DevTools /json/new"
   };
+}
+
+async function ensureBossSearchReady(port, options = {}) {
+  const attempts = Number.isFinite(options.attempts) ? Math.max(1, options.attempts) : 4;
+  const inspectTimeoutMs = Number.isFinite(options.inspectTimeoutMs) ? options.inspectTimeoutMs : 6000;
+  const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : 1000;
+  const settleMs = Number.isFinite(options.settleMs) ? options.settleMs : 800;
+
+  let pageState = await inspectBossPageState(port, { timeoutMs: inspectTimeoutMs, pollMs });
+  if (pageState.state === "SEARCH_READY" || pageState.state === "LOGIN_REQUIRED") {
+    return pageState;
+  }
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    if (pageState.state === "DEBUG_PORT_UNREACHABLE") {
+      await sleep(settleMs);
+    } else {
+      const openResult = await openBossSearchTab(port);
+      if (openResult.ok) {
+        console.log(
+          `Requested Boss search tab via DevTools /json/new (${openResult.method}) [attempt ${attempt}/${attempts}]`
+        );
+      } else {
+        console.log(
+          `Could not request Boss search tab via DevTools /json/new [attempt ${attempt}/${attempts}]: ${openResult.error}`
+        );
+      }
+      await sleep(settleMs);
+    }
+
+    pageState = await inspectBossPageState(port, { timeoutMs: inspectTimeoutMs, pollMs });
+    if (pageState.state === "SEARCH_READY" || pageState.state === "LOGIN_REQUIRED") {
+      return pageState;
+    }
+  }
+
+  return pageState;
 }
 
 function hasModule(moduleName) {
@@ -721,20 +787,10 @@ async function calibrate(options) {
     }
   } else {
     console.log(`Detected existing Chrome debug instance on port ${port}; calibration will reuse it.`);
-    let pageState = preState;
-    if (pageState.state !== "SEARCH_READY") {
-      const openResult = await openBossSearchTab(port);
-      if (openResult.ok) {
-        console.log(
-          `Requested Boss search tab via DevTools /json/new (${openResult.method}) before calibration`
-        );
-      } else {
-        console.log(
-          `Could not request Boss search tab via DevTools /json/new before calibration: ${openResult.error}`
-        );
-      }
-      pageState = await inspectBossPageState(port, { timeoutMs: 6000, pollMs: 1000 });
-    }
+    const pageState =
+      preState.state === "SEARCH_READY"
+        ? preState
+        : await ensureBossSearchReady(port, { attempts: 4, inspectTimeoutMs: 6000, pollMs: 1000 });
     launchResult = {
       ok: pageState.state === "SEARCH_READY",
       state: pageState.state,
@@ -796,8 +852,10 @@ async function launchChrome(options) {
     const args = [
       `--remote-debugging-port=${port}`,
       `--user-data-dir=${userDataDir}`,
+      "--no-first-run",
+      "--no-default-browser-check",
       "--new-window",
-      bossUrl
+      "about:blank"
     ];
     const child = spawn(chromePath, args, {
       detached: true,
@@ -807,19 +865,10 @@ async function launchChrome(options) {
     child.unref();
     console.log(`Chrome launched with remote debugging port ${port}`);
     console.log(`User data dir: ${userDataDir}`);
-    console.log(`URL: ${bossUrl}`);
+    console.log(`Target URL: ${bossUrl}`);
   }
 
-  let pageState = await inspectBossPageState(port, { timeoutMs: 12000, pollMs: 1000 });
-  if (pageState.state === "BOSS_TAB_NOT_FOUND") {
-    const openResult = await openBossSearchTab(port);
-    if (openResult.ok) {
-      console.log(`Requested Boss search tab via DevTools /json/new (${openResult.method})`);
-      pageState = await inspectBossPageState(port, { timeoutMs: 6000, pollMs: 1000 });
-    } else {
-      console.log(`Could not request Boss search tab via DevTools /json/new: ${openResult.error}`);
-    }
-  }
+  const pageState = await ensureBossSearchReady(port, { attempts: 6, inspectTimeoutMs: 6000, pollMs: 1000 });
 
   if (pageState.state === "SEARCH_READY") {
     console.log("Boss search page is ready.");

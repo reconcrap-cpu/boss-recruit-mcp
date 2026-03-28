@@ -6,6 +6,7 @@ export class BossSearcher {
     this.port = port;
     this.client = null;
     this.Runtime = null;
+    this.bossSearchUrl = 'https://www.zhipin.com/web/chat/search';
   }
 
   async connect() {
@@ -65,6 +66,112 @@ export class BossSearcher {
       console.log('  刷新iframe时出错:', e.message);
       return { error: e.message };
     }
+  }
+
+  async getDownloadPopupState() {
+    try {
+      const state = await this.evaluate(
+        "(function() {" +
+        "  const popup = document.querySelector('.boss-popup__wrapper.dialog-bosszp-download');" +
+        "  const currentUrl = window.location.href;" +
+        "  if (!popup) {" +
+        "    return { found: false, visible: false, currentUrl: currentUrl };" +
+        "  }" +
+        "  const style = window.getComputedStyle(popup);" +
+        "  const visible = popup.offsetParent !== null" +
+        "    && style.display !== 'none'" +
+        "    && style.visibility !== 'hidden'" +
+        "    && style.opacity !== '0';" +
+        "  return { found: true, visible: visible, currentUrl: currentUrl };" +
+        "})()"
+      );
+      return state || { found: false, visible: false, currentUrl: null };
+    } catch (e) {
+      return { found: false, visible: false, currentUrl: null, error: e.message };
+    }
+  }
+
+  async reloadTopPage() {
+    try {
+      await this.evaluate(
+        "(function() {" +
+        "  window.location.reload();" +
+        "  return { success: true };" +
+        "})()"
+      );
+      return { success: true };
+    } catch (e) {
+      return { error: e.message };
+    }
+  }
+
+  async navigateTopPage(url) {
+    const safeUrl = String(url || this.bossSearchUrl).replace(/'/g, "\\'");
+    try {
+      await this.evaluate(
+        "(function() {" +
+        "  window.location.href = '" + safeUrl + "';" +
+        "  return { success: true };" +
+        "})()"
+      );
+      return { success: true };
+    } catch (e) {
+      return { error: e.message };
+    }
+  }
+
+  async ensureDownloadPopupCleared(options = {}) {
+    const maxAttempts = Number.isFinite(options.maxAttempts) ? options.maxAttempts : 3;
+    const expectedUrl = options.expectedUrl || this.bossSearchUrl;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const state = await this.getDownloadPopupState();
+      const currentUrl = state && state.currentUrl ? state.currentUrl : '';
+      const onSearchPage = currentUrl.includes('/web/chat/search');
+
+      if (!state || !state.visible) {
+        if (!onSearchPage) {
+          console.log('⚠️ 当前不在Boss搜索页，重新进入搜索页...');
+          const navResult = await this.navigateTopPage(expectedUrl);
+          if (navResult && navResult.error) {
+            return { error: 'navigate failed: ' + navResult.error };
+          }
+          await this.sleep(3500);
+          continue;
+        }
+
+        console.log('✅ 下载广告弹窗检查通过');
+        return { success: true };
+      }
+
+      console.log('⚠️ 检测到下载广告弹窗，执行恢复操作 (尝试 ' + attempt + '/' + maxAttempts + ')...');
+
+      if (attempt % 2 === 1) {
+        const reloadResult = await this.reloadTopPage();
+        if (reloadResult && reloadResult.error) {
+          return { error: 'reload failed: ' + reloadResult.error };
+        }
+      } else {
+        const navResult = await this.navigateTopPage(expectedUrl);
+        if (navResult && navResult.error) {
+          return { error: 'navigate failed: ' + navResult.error };
+        }
+      }
+
+      await this.sleep(3500);
+    }
+
+    const finalState = await this.getDownloadPopupState();
+    if (finalState && finalState.visible) {
+      return { error: 'download popup still visible after recovery' };
+    }
+
+    const finalUrl = finalState && finalState.currentUrl ? finalState.currentUrl : '';
+    if (finalUrl && !finalUrl.includes('/web/chat/search')) {
+      return { error: 'boss search page not ready after recovery, current url: ' + finalUrl };
+    }
+
+    return { success: true };
   }
 
   async setKeywords(keywords) {

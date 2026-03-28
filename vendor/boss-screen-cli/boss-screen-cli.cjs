@@ -2,55 +2,636 @@
 const WebSocket = require('ws');
 const http = require('http');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const readline = require('readline');
+const { spawn, spawnSync } = require('child_process');
+const DEFAULT_DEBUG_PORT = 9222;
 
-const args = process.argv.slice(2).reduce((acc, arg, i, arr) => {
-    if (arg.startsWith('--')) {
-        const key = arg.slice(2);
-        acc[key] = arr[i + 1] && !arr[i + 1].startsWith('--') ? arr[i + 1] : true;
+function parsePositiveInteger(raw) {
+    const value = Number.parseInt(String(raw || ''), 10);
+    if (Number.isFinite(value) && value > 0) {
+        return value;
     }
-    return acc;
-}, {});
+    return null;
+}
 
-const baseUrl = args.baseurl || args.baseUrl;
-const apiKey = args.apikey || args.apiKey;
-const model = args.model;
-const criteria = args.criteria;
-const targetCount = parseInt(args.target || args.targetCount || '10');
-const debugPort = Number.parseInt(args.port || '9222', 10);
-const configFile = args.config || 'favorite-calibration.json';
-const outputCsv = args.output || `筛选结果_${Date.now()}.csv`;
+function resolveDebugPort({ explicitPort = null, configPort = null } = {}) {
+    const fromExplicit = parsePositiveInteger(explicitPort);
+    if (fromExplicit) return fromExplicit;
+    const fromEnv = parsePositiveInteger(process.env.BOSS_RECRUIT_CHROME_PORT);
+    if (fromEnv) return fromEnv;
+    const fromConfig = parsePositiveInteger(configPort);
+    if (fromConfig) return fromConfig;
+    return DEFAULT_DEBUG_PORT;
+}
 
-if (!baseUrl || !apiKey || !model || !criteria || !targetCount) {
-    console.error('Usage: node boss-cli.js --baseurl <url> --apikey <key> --model <model> --criteria <criteria> --targetCount <n> [--config <file>] [--output <csv>]');
-    process.exit(1);
+function parseCliArgs(argv) {
+    const parsed = {};
+    for (let i = 0; i < argv.length; i++) {
+        const token = argv[i];
+
+        if (token === '-h') {
+            parsed.help = true;
+            continue;
+        }
+        if (token === '-p') {
+            const next = argv[i + 1];
+            if (next && !next.startsWith('-')) {
+                parsed.port = next;
+                i += 1;
+            } else {
+                parsed.port = true;
+            }
+            continue;
+        }
+        if (!token.startsWith('--')) {
+            continue;
+        }
+
+        const eqIndex = token.indexOf('=');
+        if (eqIndex > 2) {
+            const key = token.slice(2, eqIndex);
+            const value = token.slice(eqIndex + 1);
+            parsed[key] = value || true;
+            continue;
+        }
+
+        const key = token.slice(2);
+        const next = argv[i + 1];
+        if (next && !next.startsWith('-')) {
+            parsed[key] = next;
+            i += 1;
+        } else {
+            parsed[key] = true;
+        }
+    }
+    return parsed;
+}
+
+const args = parseCliArgs(process.argv.slice(2));
+
+let baseUrl = args.baseurl || args.baseUrl || null;
+let apiKey = args.apikey || args.apiKey || null;
+let model = args.model || null;
+let openaiOrganization = args['openai-organization'] || args.openaiOrganization || null;
+let openaiProject = args['openai-project'] || args.openaiProject || null;
+let criteria = args.criteria || null;
+let targetCount = Number.parseInt(args.target || args.targetCount || '', 10);
+if (!Number.isFinite(targetCount) || targetCount <= 0) {
+    targetCount = null;
+}
+let debugPort = resolveDebugPort({ explicitPort: args.port });
+let configFile = args.config ? path.resolve(String(args.config)) : path.resolve(process.cwd(), 'favorite-calibration.json');
+let outputCsv = args.output || `筛选结果_${Date.now()}.csv`;
+const bossSearchUrl = 'https://www.zhipin.com/web/chat/search';
+const calibrationScriptPath = path.join(__dirname, 'calibrate-favorite-position-v2.cjs');
+const MAX_RESUME_TEXT_CHARS = 12000;
+const OPENAI_DEFAULT_BASE_URL = 'https://api.openai.com/v1';
+
+const startupDiscovered = discoverInstalledBossRecruitResources();
+applyDiscoveredResources(startupDiscovered);
+applyOpenAIEnvironmentDefaults();
+
+if (args.help) {
+    printUsage();
+    process.exit(0);
+}
+
+function printUsage() {
+    const scriptName = path.basename(process.argv[1] || 'boss-screen-cli.cjs');
+    console.log(`Usage: node ${scriptName} --criteria <criteria> --targetCount <n> [--baseurl <url>] [--apikey <key>] [--model <model>] [--openai-organization <org_id>] [--openai-project <project_id>] [--port <number>] [--config <favorite-calibration.json>] [--output <csv>]`);
+    console.log(`  -p, --port <number>   Chrome调试端口（默认: ${debugPort}）`);
+    console.log('  -h, --help            显示帮助');
+    console.log('  端口优先级: --port > BOSS_RECRUIT_CHROME_PORT > screening-config.json.debugPort > 9222');
+    console.log('Tip: run without parameters to enter step-by-step interactive mode.');
+}
+
+function parseKeyValueOutput(text) {
+    const map = {};
+    String(text || '').split(/\r?\n/).forEach((line) => {
+        const idx = line.indexOf('=');
+        if (idx <= 0) return;
+        const key = line.slice(0, idx).trim();
+        const value = line.slice(idx + 1).trim();
+        if (key && value) {
+            map[key] = value;
+        }
+    });
+    return map;
+}
+
+function looksLikePlaceholder(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (!normalized) return true;
+    if (normalized.includes('replace-with-your')) return true;
+    if (normalized.includes('your-api-key')) return true;
+    if (normalized.includes('your-model-name')) return true;
+    if (normalized.includes('example.com')) return true;
+    return false;
+}
+
+function applyOpenAIEnvironmentDefaults() {
+    const envBaseUrl = String(process.env.OPENAI_BASE_URL || '').trim();
+    const envApiKey = String(process.env.OPENAI_API_KEY || '').trim();
+    const envModel = String(process.env.OPENAI_MODEL || '').trim();
+    const envOrg = String(process.env.OPENAI_ORG_ID || '').trim();
+    const envProject = String(process.env.OPENAI_PROJECT_ID || '').trim();
+
+    if (!apiKey && envApiKey) {
+        apiKey = envApiKey;
+    }
+    if (!baseUrl) {
+        if (envBaseUrl) {
+            baseUrl = envBaseUrl;
+        } else if (apiKey) {
+            baseUrl = OPENAI_DEFAULT_BASE_URL;
+        }
+    }
+    if (!model && envModel) {
+        model = envModel;
+    }
+    if (!openaiOrganization && envOrg) {
+        openaiOrganization = envOrg;
+    }
+    if (!openaiProject && envProject) {
+        openaiProject = envProject;
+    }
+}
+
+function readJsonFile(filePath) {
+    try {
+        const content = fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '');
+        return JSON.parse(content);
+    } catch {
+        return null;
+    }
+}
+
+function isUsableCalibrationFile(filePath) {
+    if (!filePath || !fs.existsSync(filePath)) return false;
+    const data = readJsonFile(filePath);
+    return Boolean(data && data.favoritePosition && Number.isFinite(data.favoritePosition.pageX) && Number.isFinite(data.favoritePosition.pageY));
+}
+
+function runBossRecruitWhere() {
+    const direct = spawnSync('boss-recruit-mcp', ['where'], {
+        encoding: 'utf8'
+    });
+    if (direct.status === 0) {
+        return parseKeyValueOutput(direct.stdout);
+    }
+
+    if (process.platform !== 'win32') {
+        return null;
+    }
+
+    try {
+        const fallback = spawnSync('cmd.exe', ['/d', '/s', '/c', 'boss-recruit-mcp where'], {
+            encoding: 'utf8'
+        });
+        if (fallback.status !== 0) {
+            return null;
+        }
+        return parseKeyValueOutput(fallback.stdout);
+    } catch {
+        return null;
+    }
+}
+
+function discoverInstalledBossRecruitResources() {
+    const where = runBossRecruitWhere();
+    const codexHome = process.env.CODEX_HOME
+        ? path.resolve(process.env.CODEX_HOME)
+        : path.join(os.homedir(), '.codex');
+
+    const configCandidates = [];
+    if (where && where.config_target) {
+        configCandidates.push(path.resolve(where.config_target));
+    }
+    configCandidates.push(path.join(codexHome, 'boss-recruit-mcp', 'screening-config.json'));
+
+    let discoveredConfig = null;
+    let discoveredConfigPath = null;
+    for (const candidate of configCandidates) {
+        if (!candidate || !fs.existsSync(candidate)) continue;
+        const parsed = readJsonFile(candidate);
+        if (!parsed || typeof parsed !== 'object') continue;
+        const hasUsableCore = !looksLikePlaceholder(parsed.baseUrl)
+            && (!looksLikePlaceholder(parsed.apiKey) || Boolean(process.env.OPENAI_API_KEY))
+            && !looksLikePlaceholder(parsed.model);
+        if (!hasUsableCore) continue;
+        discoveredConfig = parsed;
+        discoveredConfigPath = candidate;
+        break;
+    }
+
+    const calibrationCandidates = [];
+    if (where && where.calibration_target) {
+        calibrationCandidates.push(path.resolve(where.calibration_target));
+    }
+    if (discoveredConfig && discoveredConfigPath && typeof discoveredConfig.calibrationFile === 'string' && discoveredConfig.calibrationFile.trim()) {
+        calibrationCandidates.unshift(path.resolve(path.dirname(discoveredConfigPath), discoveredConfig.calibrationFile));
+    }
+    calibrationCandidates.push(path.join(codexHome, 'boss-recruit-mcp', 'favorite-calibration.json'));
+
+    let discoveredCalibrationPath = null;
+    for (const candidate of calibrationCandidates) {
+        if (isUsableCalibrationFile(candidate)) {
+            discoveredCalibrationPath = candidate;
+            break;
+        }
+    }
+
+    return {
+        where,
+        config: discoveredConfig,
+        configPath: discoveredConfigPath,
+        calibrationPath: discoveredCalibrationPath
+    };
+}
+
+function applyDiscoveredResources(discovered) {
+    if (!discovered) return;
+
+    if (discovered.config) {
+        if (!baseUrl) baseUrl = discovered.config.baseUrl;
+        if (!apiKey) apiKey = discovered.config.apiKey;
+        if (!model) model = discovered.config.model;
+        if (!openaiOrganization && typeof discovered.config.openaiOrganization === 'string' && discovered.config.openaiOrganization.trim()) {
+            openaiOrganization = discovered.config.openaiOrganization.trim();
+        }
+        if (!openaiProject && typeof discovered.config.openaiProject === 'string' && discovered.config.openaiProject.trim()) {
+            openaiProject = discovered.config.openaiProject.trim();
+        }
+
+        debugPort = resolveDebugPort({
+            explicitPort: args.port,
+            configPort: discovered.config.debugPort
+        });
+
+        if (!args.output && typeof discovered.config.outputDir === 'string' && discovered.config.outputDir.trim()) {
+            const outputDir = discovered.config.outputDir.trim();
+            const resolvedOutputDir = path.isAbsolute(outputDir)
+                ? outputDir
+                : path.resolve(path.dirname(discovered.configPath || process.cwd()), outputDir);
+            try {
+                fs.mkdirSync(resolvedOutputDir, { recursive: true });
+                outputCsv = path.join(resolvedOutputDir, path.basename(outputCsv));
+            } catch {}
+        }
+    }
+
+    if (!args.config && discovered.calibrationPath) {
+        configFile = discovered.calibrationPath;
+    }
+}
+
+function runCalibrationScript(port, outputFilePath) {
+    return new Promise((resolve) => {
+        const child = spawn(
+            process.execPath,
+            [
+                calibrationScriptPath,
+                '--port',
+                String(port),
+                '--output',
+                outputFilePath,
+                '--timeout-ms',
+                '60000'
+            ],
+            {
+                stdio: 'inherit',
+                shell: false
+            }
+        );
+        child.on('close', (code) => resolve(code ?? 1));
+        child.on('error', () => resolve(1));
+    });
+}
+
+function askQuestion(rl, question) {
+    return new Promise((resolve) => {
+        rl.question(question, (answer) => resolve(String(answer || '').trim()));
+    });
+}
+
+async function askRequired(rl, question) {
+    while (true) {
+        const value = await askQuestion(rl, question);
+        if (value) return value;
+        console.log('输入不能为空，请重试。');
+    }
+}
+
+async function askPositiveInteger(rl, question, defaultValue = null) {
+    while (true) {
+        const raw = await askQuestion(rl, question);
+        if (!raw && Number.isFinite(defaultValue) && defaultValue > 0) {
+            return defaultValue;
+        }
+        const n = Number.parseInt(raw, 10);
+        if (Number.isFinite(n) && n > 0) {
+            return n;
+        }
+        console.log('请输入有效的正整数。');
+    }
+}
+
+async function ensureRuntimeConfig() {
+    const discovered = discoverInstalledBossRecruitResources();
+    applyDiscoveredResources(discovered);
+    applyOpenAIEnvironmentDefaults();
+
+    const hasCoreConfig = Boolean(baseUrl && apiKey && model);
+    const hasScreeningInputs = Boolean(criteria && Number.isFinite(targetCount) && targetCount > 0);
+    const needsInteractive = !hasCoreConfig || !hasScreeningInputs;
+
+    if (!needsInteractive) {
+        return;
+    }
+
+    if (!process.stdin.isTTY) {
+        printUsage();
+        throw new Error('Missing required parameters in non-interactive mode.');
+    }
+
+    console.log('========================================');
+    console.log('Boss Screen CLI Interactive Setup');
+    console.log('========================================');
+
+    if (discovered.configPath) {
+        console.log(`发现可用 screening-config.json: ${discovered.configPath}`);
+    } else {
+        console.log('未发现可用 screening-config.json，需要手动输入 LLM 参数。');
+    }
+    if (isUsableCalibrationFile(configFile)) {
+        console.log(`发现可用校准文件: ${configFile}`);
+    } else {
+        console.log('未发现可用校准文件：将优先使用DOM收藏；仅在DOM不可用时才需要calibration回退。');
+    }
+    console.log('');
+
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+    });
+
+    try {
+        if (!criteria) {
+            criteria = await askRequired(rl, 'Step 1/6 请输入筛选标准 criteria: ');
+        }
+
+        if (!Number.isFinite(targetCount) || targetCount <= 0) {
+            targetCount = await askPositiveInteger(rl, 'Step 2/6 请输入目标处理人数 targetCount (例如 10): ', 10);
+        }
+
+        if (!args.port) {
+            debugPort = await askPositiveInteger(rl, `Step 3/6 请输入 Chrome 调试端口 (默认 ${debugPort}): `, debugPort);
+        }
+
+        if (!baseUrl) {
+            baseUrl = await askRequired(rl, 'Step 4/6 请输入 LLM Base URL: ');
+        }
+        if (!apiKey) {
+            apiKey = await askRequired(rl, 'Step 5/6 请输入 LLM API Key: ');
+        }
+        if (!model) {
+            model = await askRequired(rl, 'Step 6/6 请输入 LLM 模型型号: ');
+        }
+    } finally {
+        rl.close();
+    }
+
 }
 
 function loadCalibration() {
-    if (!fs.existsSync(configFile)) {
-        console.error(`错误: 校准文件不存在: ${configFile}`);
-        console.error('请先运行校准脚本');
-        process.exit(1);
+    if (!isUsableCalibrationFile(configFile)) {
+        return null;
     }
     const content = fs.readFileSync(configFile, 'utf8').replace(/^\uFEFF/, '');
     const data = JSON.parse(content);
+    if (!data || !data.favoritePosition) {
+        return null;
+    }
     return data.favoritePosition;
 }
 
 async function getChromeTab() {
+    return getChromeTabWithGuard({ autoLaunchIfMissing: process.stdin.isTTY === true });
+}
+
+function createTaggedError(code, message, cause) {
+    const error = new Error(message);
+    error.code = code;
+    if (cause) {
+        error.cause = cause;
+    }
+    return error;
+}
+
+function getChromeExecutablePath() {
+    const candidates = [
+        process.env.BOSS_RECRUIT_CHROME_PATH,
+        path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        path.join(process.env.ProgramFiles || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        path.join(process.env['ProgramFiles(x86)'] || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        '/usr/bin/google-chrome',
+        '/usr/bin/chromium-browser',
+        '/usr/bin/chromium'
+    ].filter(Boolean);
+
+    for (const candidate of candidates) {
+        try {
+            if (fs.existsSync(candidate)) {
+                return candidate;
+            }
+        } catch {}
+    }
+    return null;
+}
+
+function getChromeUserDataDirForPort(port) {
+    const codexHome = process.env.CODEX_HOME
+        ? path.resolve(process.env.CODEX_HOME)
+        : path.join(os.homedir(), '.codex');
+    const dir = path.join(codexHome, 'boss-recruit-mcp', `chrome-profile-${port}`);
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+}
+
+function launchChromeDebugInstance(port) {
+    const chromePath = getChromeExecutablePath();
+    if (!chromePath) {
+        return {
+            ok: false,
+            error: '未找到 Chrome 可执行文件，请先安装 Chrome 或设置 BOSS_RECRUIT_CHROME_PATH。'
+        };
+    }
+
+    try {
+        const userDataDir = getChromeUserDataDirForPort(port);
+        const child = spawn(
+            chromePath,
+            [
+                `--remote-debugging-port=${port}`,
+                `--user-data-dir=${userDataDir}`,
+                '--new-window',
+                bossSearchUrl
+            ],
+            {
+                detached: true,
+                stdio: 'ignore',
+                windowsHide: false
+            }
+        );
+        child.unref();
+        return {
+            ok: true,
+            chromePath,
+            userDataDir
+        };
+    } catch (error) {
+        return {
+            ok: false,
+            error: `启动 Chrome 失败: ${error.message}`
+        };
+    }
+}
+
+async function listChromeTabsOnPort(port) {
     return new Promise((resolve, reject) => {
-        http.get(`http://localhost:${debugPort}/json/list`, (res) => {
+        const req = http.get(`http://localhost:${port}/json/list`, (res) => {
             let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => {
-                const tabs = JSON.parse(data);
-                const bossTab = tabs.find(t => t.url && t.url.includes('zhipin.com'));
-                if (bossTab) resolve(bossTab);
-                else reject(new Error('未找到BOSS直聘页面'));
+            res.on('data', (chunk) => {
+                data += chunk;
             });
-        }).on('error', reject);
+            res.on('end', () => {
+                if (res.statusCode !== 200) {
+                    reject(createTaggedError('DEBUG_PORT_BAD_STATUS', `DevTools 返回状态码 ${res.statusCode}`));
+                    return;
+                }
+                try {
+                    const tabs = JSON.parse(data);
+                    if (!Array.isArray(tabs)) {
+                        reject(createTaggedError('DEBUG_PORT_BAD_RESPONSE', 'DevTools 返回数据不是数组'));
+                        return;
+                    }
+                    resolve(tabs);
+                } catch (error) {
+                    reject(createTaggedError('DEBUG_PORT_BAD_RESPONSE', `DevTools 返回无法解析: ${error.message}`, error));
+                }
+            });
+        });
+
+        req.setTimeout(5000, () => {
+            req.destroy(createTaggedError('DEBUG_PORT_TIMEOUT', `连接调试端口 ${port} 超时`));
+        });
+
+        req.on('error', (error) => {
+            const tagged = createTaggedError(
+                'DEBUG_PORT_UNAVAILABLE',
+                `无法连接调试端口 ${port}: ${error.message}`,
+                error
+            );
+            tagged.originalCode = error.code;
+            reject(tagged);
+        });
     });
+}
+
+function findBossTabFromTabs(tabs) {
+    return tabs.find((tab) => tab && typeof tab.url === 'string' && tab.url.includes('zhipin.com')) || null;
+}
+
+function isDebugPortUnavailableError(error) {
+    if (!error) return false;
+    if (error.code === 'DEBUG_PORT_UNAVAILABLE' || error.code === 'DEBUG_PORT_TIMEOUT') return true;
+    const msg = String(error.message || '');
+    return /(ECONNREFUSED|ECONNRESET|ENOTFOUND|EHOSTUNREACH|ETIMEDOUT|socket hang up|connect)/i.test(msg);
+}
+
+async function promptUserAfterChromeAutoLaunch(port) {
+    console.log('');
+    console.log(`端口 ${port} 未检测到可用 Chrome 调试实例，已自动启动新的 Chrome 窗口。`);
+    console.log('请在该窗口中完成以下操作：');
+    console.log('1. 登录 Boss 账号');
+    console.log('2. 打开 Boss 搜索页并完成你要筛选的搜索条件');
+    console.log('3. 保持页面停留在搜索结果相关页面');
+    console.log('');
+
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+    });
+
+    try {
+        while (true) {
+            const answer = (await askQuestion(rl, '完成后输入 done 继续（输入 quit 退出）: ')).toLowerCase();
+            if (['done', 'd', 'ok', 'yes', 'y', '完成', '已完成', '继续', 'ready'].includes(answer)) {
+                return true;
+            }
+            if (['quit', 'q', 'exit', 'no', 'n', '取消'].includes(answer)) {
+                return false;
+            }
+            console.log('未识别输入，请输入 done 或 quit。');
+        }
+    } finally {
+        rl.close();
+    }
+}
+
+async function waitForBossTabAfterConfirmation(port, timeoutMs = 15000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        try {
+            const tabs = await listChromeTabsOnPort(port);
+            const bossTab = findBossTabFromTabs(tabs);
+            if (bossTab) {
+                return bossTab;
+            }
+        } catch {}
+        await sleep(800);
+    }
+    return null;
+}
+
+async function getChromeTabWithGuard(options = {}) {
+    const autoLaunchIfMissing = options.autoLaunchIfMissing === true;
+
+    try {
+        const tabs = await listChromeTabsOnPort(debugPort);
+        const bossTab = findBossTabFromTabs(tabs);
+        if (bossTab) {
+            return bossTab;
+        }
+        throw createTaggedError('BOSS_TAB_NOT_FOUND', `调试端口 ${debugPort} 可连接，但未找到 Boss 页面`);
+    } catch (error) {
+        if (!isDebugPortUnavailableError(error) || !autoLaunchIfMissing) {
+            throw error;
+        }
+
+        const launchResult = launchChromeDebugInstance(debugPort);
+        if (!launchResult.ok) {
+            throw createTaggedError('CHROME_AUTO_LAUNCH_FAILED', launchResult.error);
+        }
+
+        console.log(`已自动启动 Chrome: ${launchResult.chromePath}`);
+        console.log(`调试端口: ${debugPort}`);
+
+        const confirmed = await promptUserAfterChromeAutoLaunch(debugPort);
+        if (!confirmed) {
+            throw createTaggedError('USER_ABORTED_PREPARE_SEARCH', '用户取消了登录/搜索准备流程');
+        }
+
+        const bossTab = await waitForBossTabAfterConfirmation(debugPort, 20000);
+        if (!bossTab) {
+            throw createTaggedError('BOSS_TAB_NOT_FOUND_AFTER_CONFIRM', '用户确认完成后仍未检测到 Boss 页面，请检查是否在正确端口打开');
+        }
+
+        return bossTab;
+    }
 }
 
 class CDPClient {
@@ -713,6 +1294,210 @@ const jsGetFavoriteCanvasPosition = `(function(){
     return JSON.stringify({success:false,error:'Canvas not found'});
 })()`;
 
+const jsGetFavoriteDomState = `(function(){
+    function isFrameVisible(iframe){
+        if(!iframe) return false;
+        try{
+            var rect=iframe.getBoundingClientRect();
+            if(!rect||rect.width<=0||rect.height<=0) return false;
+            var style=window.getComputedStyle?window.getComputedStyle(iframe):null;
+            if(style&&(style.display==='none'||style.visibility==='hidden'||Number(style.opacity||'1')<=0)) return false;
+            return true;
+        }catch(e){
+            return false;
+        }
+    }
+    function isButtonVisible(btn,view){
+        if(!btn) return false;
+        try{
+            var rect=btn.getBoundingClientRect();
+            if(!rect||rect.width<=0||rect.height<=0) return false;
+            var style=(view&&view.getComputedStyle)?view.getComputedStyle(btn):null;
+            if(style&&(style.display==='none'||style.visibility==='hidden'||Number(style.opacity||'1')<=0)) return false;
+            return true;
+        }catch(e){
+            return false;
+        }
+    }
+    function pickButton(doc){
+        if(!doc) return null;
+        var selectors=[
+            'div.interested[aria-label*="收藏"]',
+            'div.interested:not(.already-interested)',
+            'div.interested',
+            '.interested'
+        ];
+        var view=doc.defaultView||window;
+        for(var i=0;i<selectors.length;i++){
+            var nodes=doc.querySelectorAll(selectors[i]);
+            for(var j=0;j<nodes.length;j++){
+                if(isButtonVisible(nodes[j],view)){
+                    return {button:nodes[j],selector:selectors[i]};
+                }
+            }
+        }
+        return null;
+    }
+    function buildState(match,source){
+        var btn=match.button;
+        var aria=(btn.getAttribute('aria-label')||'').trim();
+        var already=btn.classList.contains('already-interested')||aria.indexOf('取消收藏')>=0||aria.indexOf('已收藏')>=0;
+        var rect=btn.getBoundingClientRect();
+        var clickX=Math.round(rect.left+rect.width/2);
+        var clickY=Math.round(rect.top+rect.height/2);
+        if(source&&source.iframe){
+            var iframeRect=source.iframe.getBoundingClientRect();
+            clickX=Math.round(iframeRect.left+rect.left+rect.width/2);
+            clickY=Math.round(iframeRect.top+rect.top+rect.height/2);
+        }
+        return {
+            success:true,
+            found:true,
+            source:source&&source.type?source.type:'top',
+            iframeSrc:source&&source.iframe?String(source.iframe.getAttribute('src')||source.iframe.src||''):'',
+            selector:match.selector,
+            ariaLabel:aria,
+            className:btn.className||'',
+            alreadyInterested:already,
+            clickX:clickX,
+            clickY:clickY
+        };
+    }
+
+    try{
+        var topMatch=pickButton(document);
+        if(topMatch){
+            return JSON.stringify(buildState(topMatch,{type:'top'}));
+        }
+
+        var iframes=document.querySelectorAll('iframe');
+        for(var i=0;i<iframes.length;i++){
+            var iframe=iframes[i];
+            if(!isFrameVisible(iframe)) continue;
+            try{
+                var doc=iframe.contentDocument||(iframe.contentWindow&&iframe.contentWindow.document);
+                if(!doc) continue;
+                var frameMatch=pickButton(doc);
+                if(frameMatch){
+                    return JSON.stringify(buildState(frameMatch,{type:'iframe',iframe:iframe}));
+                }
+            }catch(e){
+                // ignore inaccessible iframe
+            }
+        }
+
+        return JSON.stringify({
+            success:true,
+            found:false,
+            reason:'favorite dom button not found in top document or accessible iframes'
+        });
+    }catch(e){
+        return JSON.stringify({success:false,reason:e.message||String(e)});
+    }
+})()`;
+
+const jsClickFavoriteDom = `(function(){
+    function isFrameVisible(iframe){
+        if(!iframe) return false;
+        try{
+            var rect=iframe.getBoundingClientRect();
+            if(!rect||rect.width<=0||rect.height<=0) return false;
+            var style=window.getComputedStyle?window.getComputedStyle(iframe):null;
+            if(style&&(style.display==='none'||style.visibility==='hidden'||Number(style.opacity||'1')<=0)) return false;
+            return true;
+        }catch(e){
+            return false;
+        }
+    }
+    function isButtonVisible(btn,view){
+        if(!btn) return false;
+        try{
+            var rect=btn.getBoundingClientRect();
+            if(!rect||rect.width<=0||rect.height<=0) return false;
+            var style=(view&&view.getComputedStyle)?view.getComputedStyle(btn):null;
+            if(style&&(style.display==='none'||style.visibility==='hidden'||Number(style.opacity||'1')<=0)) return false;
+            return true;
+        }catch(e){
+            return false;
+        }
+    }
+    function findButton(doc){
+        if(!doc) return null;
+        var selectors=[
+            'div.interested[aria-label*="收藏"]',
+            'div.interested:not(.already-interested)',
+            'div.interested',
+            '.interested'
+        ];
+        var view=doc.defaultView||window;
+        for(var i=0;i<selectors.length;i++){
+            var nodes=doc.querySelectorAll(selectors[i]);
+            for(var j=0;j<nodes.length;j++){
+                if(isButtonVisible(nodes[j],view)){
+                    return {button:nodes[j],selector:selectors[i],doc:doc};
+                }
+            }
+        }
+        return null;
+    }
+    function dispatchHumanLikeClick(btn,doc){
+        var view=(doc&&doc.defaultView)?doc.defaultView:window;
+        var MouseCtor=view.MouseEvent||MouseEvent;
+        var rect=btn.getBoundingClientRect();
+        var cx=rect.left+rect.width/2;
+        var cy=rect.top+rect.height/2;
+        var opts={bubbles:true,cancelable:true,composed:true,view:view,clientX:cx,clientY:cy,button:0};
+        btn.dispatchEvent(new MouseCtor('mousemove',opts));
+        btn.dispatchEvent(new MouseCtor('mousedown',opts));
+        btn.dispatchEvent(new MouseCtor('mouseup',opts));
+        btn.dispatchEvent(new MouseCtor('click',opts));
+        if(typeof btn.click==='function'){
+            btn.click();
+        }
+    }
+    try{
+        var found=findButton(document);
+        var source='top';
+        var iframeSrc='';
+
+        if(!found){
+            var iframes=document.querySelectorAll('iframe');
+            for(var i=0;i<iframes.length;i++){
+                var iframe=iframes[i];
+                if(!isFrameVisible(iframe)) continue;
+                try{
+                    var doc=iframe.contentDocument||(iframe.contentWindow&&iframe.contentWindow.document);
+                    if(!doc) continue;
+                    found=findButton(doc);
+                    if(found){
+                        source='iframe';
+                        iframeSrc=String(iframe.getAttribute('src')||iframe.src||'');
+                        break;
+                    }
+                }catch(e){
+                    // ignore inaccessible iframe
+                }
+            }
+        }
+
+        if(!found){
+            return JSON.stringify({success:false,reason:'favorite dom button not found in top document or accessible iframes'});
+        }
+
+        var btn=found.button;
+        var aria=(btn.getAttribute('aria-label')||'').trim();
+        var already=btn.classList.contains('already-interested')||aria.indexOf('取消收藏')>=0||aria.indexOf('已收藏')>=0;
+        if(already){
+            return JSON.stringify({success:true,clicked:false,alreadyInterested:true,source:source,iframeSrc:iframeSrc,selector:found.selector});
+        }
+
+        dispatchHumanLikeClick(btn,found.doc);
+        return JSON.stringify({success:true,clicked:true,alreadyInterested:false,source:source,iframeSrc:iframeSrc,selector:found.selector});
+    }catch(e){
+        return JSON.stringify({success:false,reason:e.message||String(e)});
+    }
+})()`;
+
 const jsGetCardCount = `(function(){
     var frame=window.frames['searchFrame'];
     if(!frame)return '0';
@@ -729,6 +1514,41 @@ const jsGetCardCount = `(function(){
 
     return String(cards.length);
 })()`;
+
+const jsGetDownloadPopupState = `(function(){
+    try{
+        var popup=document.querySelector('.boss-popup__wrapper.dialog-bosszp-download');
+        var currentUrl=window.location.href||'';
+        if(!popup){
+            return JSON.stringify({found:false,visible:false,currentUrl:currentUrl});
+        }
+        var style=window.getComputedStyle(popup);
+        var visible=popup.offsetParent!==null&&style.display!=='none'&&style.visibility!=='hidden'&&style.opacity!=='0';
+        return JSON.stringify({found:true,visible:visible,currentUrl:currentUrl});
+    }catch(e){
+        return JSON.stringify({found:false,visible:false,currentUrl:window.location.href||'',error:e.message});
+    }
+})()`;
+
+const jsRecoverFromDownloadPopup = (mode, targetUrl) => `(function(mode,targetUrl){
+    try{
+        var popup=document.querySelector('.boss-popup__wrapper.dialog-bosszp-download');
+        if(popup){
+            var closeBtn=popup.querySelector('.boss-popup__close')||popup.querySelector('.icon-close');
+            if(closeBtn){
+                try{closeBtn.click();}catch(e){}
+            }
+        }
+        if(mode==='navigate'){
+            window.location.href=targetUrl;
+            return JSON.stringify({success:true,action:'navigate',targetUrl:targetUrl});
+        }
+        window.location.reload();
+        return JSON.stringify({success:true,action:'reload'});
+    }catch(e){
+        return JSON.stringify({success:false,error:e.message,action:mode});
+    }
+})(${JSON.stringify(mode)},${JSON.stringify(targetUrl)})`;
 
 async function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -959,26 +1779,66 @@ function saveProgressToCsv(candidates, filepath) {
 
 function setupSaveSignalHandler(passedCandidates, outputCsv) {
     let saveRequested = false;
+    let paused = false;
+    let stopRequested = false;
+    let hasPrintedPauseHint = false;
+    let cleanedUp = false;
+
+    const cleanup = () => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        process.off('SIGINT', onSigint);
+        if (process.stdin.isTTY) {
+            try {
+                process.stdin.setRawMode(false);
+            } catch {}
+        }
+    };
+
+    const saveAndExit = () => {
+        console.log('\n收到中断信号，正在保存当前进度...');
+        if (saveProgressToCsv(passedCandidates, outputCsv)) {
+            console.log(`已保存 ${passedCandidates.length} 条结果到: ${outputCsv}`);
+        }
+        cleanup();
+        process.exit(0);
+    };
+
+    const onSigint = () => {
+        stopRequested = true;
+    };
 
     if (process.stdin.isTTY) {
         readline.emitKeypressEvents(process.stdin);
+        process.stdin.resume();
         process.stdin.setRawMode(true);
     }
 
-    process.stdin.on('keypress', (str, key) => {
-        if (key.ctrl && key.name === 's') {
-            saveRequested = true;
-        } else if (key.ctrl && key.name === 'c') {
-            console.log('\n收到中断信号 (Ctrl+C)...');
-            console.log('正在保存当前进度...');
-            if (saveProgressToCsv(passedCandidates, outputCsv)) {
-                console.log(`已保存 ${passedCandidates.length} 条结果到: ${outputCsv}`);
-            }
-            process.exit(0);
-        }
-    });
+    process.on('SIGINT', onSigint);
 
-    return () => {
+    if (process.stdin.isTTY) {
+        process.stdin.on('keypress', (str, key) => {
+            if (!key) return;
+            if (key.ctrl && key.name === 's') {
+                saveRequested = true;
+                return;
+            }
+            if (key.ctrl && key.name === 'p') {
+                paused = !paused;
+                console.log(paused ? '\n已暂停筛选（再次按 Ctrl+P 继续）' : '\n继续筛选...');
+                return;
+            }
+            if (key.ctrl && key.name === 'c') {
+                stopRequested = true;
+            }
+        });
+    }
+
+    const checkAndHandleControl = async () => {
+        if (stopRequested) {
+            saveAndExit();
+        }
+
         if (saveRequested) {
             saveRequested = false;
             console.log('\n========================================');
@@ -990,7 +1850,31 @@ function setupSaveSignalHandler(passedCandidates, outputCsv) {
             console.log('继续筛选...');
             console.log('========================================');
         }
+
+        while (paused) {
+            if (!hasPrintedPauseHint) {
+                hasPrintedPauseHint = true;
+                console.log('暂停中：按 Ctrl+P 继续，按 Ctrl+S 保存，按 Ctrl+C 保存并退出');
+            }
+
+            if (stopRequested) {
+                saveAndExit();
+            }
+
+            if (saveRequested) {
+                saveRequested = false;
+                if (saveProgressToCsv(passedCandidates, outputCsv)) {
+                    console.log(`暂停中已保存到: ${outputCsv}`);
+                }
+            }
+
+            await sleep(300);
+        }
+        hasPrintedPauseHint = false;
     };
+
+    checkAndHandleControl.cleanup = cleanup;
+    return checkAndHandleControl;
 }
 
 function parseResult(result) {
@@ -1003,6 +1887,154 @@ function parseResult(result) {
         }
     }
     return result;
+}
+
+function resolveChatCompletionsEndpoint(rawBaseUrl) {
+    const cleaned = String(rawBaseUrl || '').trim().replace(/\/+$/, '');
+    if (!cleaned) {
+        throw new Error('LLM baseUrl is empty');
+    }
+    if (/\/chat\/completions$/i.test(cleaned)) {
+        return cleaned;
+    }
+    return `${cleaned}/chat/completions`;
+}
+
+function extractTextFromContentParts(content) {
+    if (typeof content === 'string') {
+        return content;
+    }
+    if (!Array.isArray(content)) {
+        return null;
+    }
+
+    const parts = [];
+    for (const item of content) {
+        if (!item) continue;
+        if (typeof item === 'string') {
+            parts.push(item);
+            continue;
+        }
+        if (typeof item.text === 'string') {
+            parts.push(item.text);
+            continue;
+        }
+        if (typeof item.output_text === 'string') {
+            parts.push(item.output_text);
+        }
+    }
+    return parts.length ? parts.join('\n') : null;
+}
+
+function extractAssistantText(data) {
+    const directChoiceContent = data?.choices?.[0]?.message?.content;
+    const fromChoiceMessage = extractTextFromContentParts(directChoiceContent);
+    if (fromChoiceMessage) return fromChoiceMessage;
+
+    const fromChoiceText = data?.choices?.[0]?.text;
+    if (typeof fromChoiceText === 'string' && fromChoiceText.trim()) {
+        return fromChoiceText;
+    }
+
+    if (typeof data?.output_text === 'string' && data.output_text.trim()) {
+        return data.output_text;
+    }
+
+    if (Array.isArray(data?.output)) {
+        const outputParts = [];
+        for (const block of data.output) {
+            const extracted = extractTextFromContentParts(block?.content);
+            if (extracted) {
+                outputParts.push(extracted);
+            }
+        }
+        if (outputParts.length) {
+            return outputParts.join('\n');
+        }
+    }
+
+    return null;
+}
+
+async function getDownloadPopupState(cdp) {
+    const raw = await cdp.send('Runtime.evaluate', { expression: jsGetDownloadPopupState, returnByValue: true });
+    const parsed = parseResult(raw);
+    if (!parsed || typeof parsed !== 'object') {
+        return {
+            found: false,
+            visible: false,
+            currentUrl: '',
+            error: 'invalid popup state response'
+        };
+    }
+    return parsed;
+}
+
+async function recoverFromDownloadPopup(cdp, mode, targetUrl) {
+    const expr = jsRecoverFromDownloadPopup(mode, targetUrl);
+    const raw = await cdp.send('Runtime.evaluate', { expression: expr, returnByValue: true });
+    const parsed = parseResult(raw);
+    if (!parsed || typeof parsed !== 'object') {
+        return { success: false, error: 'invalid recover response', action: mode };
+    }
+    return parsed;
+}
+
+async function ensureDownloadPopupCleared(cdp, options = {}) {
+    const maxAttempts = Number.isFinite(options.maxAttempts) ? options.maxAttempts : 3;
+    const expectedUrl = options.expectedUrl || bossSearchUrl;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const state = await getDownloadPopupState(cdp);
+        const currentUrl = String(state.currentUrl || '');
+        const onSearchPage = currentUrl.includes('/web/chat/search');
+
+        if (!state.visible) {
+            if (!onSearchPage) {
+                console.log(`  当前不在Boss搜索页，重新导航到搜索页 (尝试 ${attempt}/${maxAttempts})...`);
+                const navResult = await recoverFromDownloadPopup(cdp, 'navigate', expectedUrl);
+                if (!navResult.success) {
+                    return {
+                        ok: false,
+                        error: `navigate failed: ${navResult.error || 'unknown'}`
+                    };
+                }
+                await sleep(3500);
+                continue;
+            }
+            console.log('  下载广告弹窗检查通过');
+            return { ok: true };
+        }
+
+        const mode = attempt % 2 === 1 ? 'reload' : 'navigate';
+        console.log(`  检测到下载广告弹窗，执行${mode === 'reload' ? '刷新' : '重进搜索页'}恢复 (尝试 ${attempt}/${maxAttempts})...`);
+        const recoverResult = await recoverFromDownloadPopup(cdp, mode, expectedUrl);
+        if (!recoverResult.success) {
+            return {
+                ok: false,
+                error: `${mode} failed: ${recoverResult.error || 'unknown'}`
+            };
+        }
+        await sleep(3500);
+    }
+
+    const finalState = await getDownloadPopupState(cdp);
+    if (finalState.visible) {
+        return {
+            ok: false,
+            error: 'download popup still visible after recovery'
+        };
+    }
+
+    const finalUrl = String(finalState.currentUrl || '');
+    if (!finalUrl.includes('/web/chat/search')) {
+        return {
+            ok: false,
+            error: `boss search page not ready after recovery, current url: ${finalUrl || 'unknown'}`
+        };
+    }
+
+    return { ok: true };
 }
 
 function formatResumeApiData(data) {
@@ -1112,24 +2144,49 @@ async function callLLM(prompt, maxRetries = 3) {
 
 ${prompt}`;
 
+    const llmEndpoint = resolveChatCompletionsEndpoint(baseUrl);
+    const requestHeaders = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+    };
+    if (openaiOrganization) {
+        requestHeaders['OpenAI-Organization'] = openaiOrganization;
+    }
+    if (openaiProject) {
+        requestHeaders['OpenAI-Project'] = openaiProject;
+    }
+
     for (let attempt = 0; attempt < maxRetries; attempt++) {
-        const response = await fetch(`${baseUrl}/chat/completions`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`
-            },
-            body: JSON.stringify({
-                model: model,
-                messages: [{ role: 'user', content: strictPrompt }],
-                temperature: 0.1,
-                max_tokens: 500
-            })
-        });
+        let response;
+        try {
+            response = await fetch(llmEndpoint, {
+                method: 'POST',
+                headers: requestHeaders,
+                body: JSON.stringify({
+                    model: model,
+                    messages: [{ role: 'user', content: strictPrompt }],
+                    temperature: 0.1,
+                    max_tokens: 500
+                })
+            });
+        } catch (error) {
+            if (attempt < maxRetries - 1) {
+                console.log(`  LLM网络请求失败，重试 (${attempt + 1}/${maxRetries})...`);
+                await sleep(800 + attempt * 400);
+                continue;
+            }
+            throw new Error(`LLM网络请求失败(endpoint=${llmEndpoint}): ${error.message}`);
+        }
 
         if (!response.ok) {
             const errorText = await response.text();
-            throw new Error(`API请求失败: ${response.status} ${response.statusText} - ${errorText}`);
+            const retryableStatus = new Set([429, 500, 502, 503, 504]);
+            if (retryableStatus.has(response.status) && attempt < maxRetries - 1) {
+                console.log(`  LLM返回${response.status}，重试 (${attempt + 1}/${maxRetries})...`);
+                await sleep(800 + attempt * 400);
+                continue;
+            }
+            throw new Error(`API请求失败(endpoint=${llmEndpoint}): ${response.status} ${response.statusText} - ${errorText}`);
         }
 
         const data = await response.json();
@@ -1138,7 +2195,15 @@ ${prompt}`;
             throw new Error(`API错误: ${data.error.message}`);
         }
 
-        const content = data.choices[0].message.content;
+        const content = extractAssistantText(data);
+        if (!content) {
+            if (attempt < maxRetries - 1) {
+                console.log('  LLM响应中未找到可解析文本，重试...');
+                await sleep(800 + attempt * 400);
+                continue;
+            }
+            throw new Error('LLM返回中缺少可解析文本（expected choices[0].message.content）');
+        }
 
         try {
             const jsonMatch = content.match(/\{[\s\S]*\}/);
@@ -1166,6 +2231,8 @@ ${prompt}`;
 }
 
 async function main() {
+    await ensureRuntimeConfig();
+
     console.log('========================================');
     console.log('BOSS直聘简历筛选CLI工具 (Node.js)');
     console.log('========================================');
@@ -1177,7 +2244,11 @@ async function main() {
     console.log('');
 
     const pos = loadCalibration();
-    console.log(`已加载校准坐标: pageX=${pos.pageX}, pageY=${pos.pageY}`);
+    if (pos) {
+        console.log(`已加载校准坐标: pageX=${pos.pageX}, pageY=${pos.pageY}`);
+    } else {
+        console.log('未加载校准坐标：将优先使用DOM收藏，必要时再回退calibration。');
+    }
     console.log('');
 
     console.log('[1/6] 连接Chrome...');
@@ -1198,6 +2269,15 @@ async function main() {
     console.log(`当前页面: ${currentUrl}`);
     console.log('');
 
+    console.log('[2.5/6] 检查下载广告弹窗...');
+    const popupReady = await ensureDownloadPopupCleared(cdp, { maxAttempts: 4, expectedUrl: bossSearchUrl });
+    if (!popupReady.ok) {
+        console.error(`错误: ${popupReady.error}`);
+        cdp.close();
+        process.exit(1);
+    }
+    console.log('');
+
     console.log('[3/6] 获取列表页信息...');
     const listInfoRaw = await cdp.send('Runtime.evaluate', { expression: jsGetList, returnByValue: true });
 
@@ -1213,7 +2293,7 @@ async function main() {
 
     console.log('[4/6] 开始筛选流程...');
     console.log('========================================');
-    console.log('快捷键: Ctrl+S 保存当前进度 | Ctrl+C 保存并退出');
+    console.log('快捷键: Ctrl+S 保存当前进度 | Ctrl+P 暂停/继续 | Ctrl+C 保存并退出');
     console.log('========================================');
     console.log('');
 
@@ -1240,7 +2320,7 @@ async function main() {
         const nextCardRaw = await cdp.send('Runtime.evaluate', { expression: findCardExpr, returnByValue: true });
         const nextCard = parseResult(nextCardRaw);
 
-        checkAndHandleSave();
+        await checkAndHandleSave();
 
 
         if (!nextCard || !nextCard.found) {
@@ -1425,7 +2505,11 @@ async function main() {
         console.log(`  公司: ${candidateInfo.company || '未知'}`);
 
         console.log('  调用LLM评估...');
-        const prompt = `你是一位专业的HR招聘助手，请根据以下筛选标准分析候选人简历，判断是否匹配。\n\n筛选标准:\n${criteria}\n\n简历内容:\n${candidateInfo.resumeText}\n\n请仔细分析简历，返回以下格式的JSON（必须是有效的JSON格式，不要包含任何其他内容）：\n{\n    "passed": true或false,\n    "reason": "通过或不通过的具体原因",\n    "summary": "简历摘要"\n}`;
+        const resumeTextForLLM = String(candidateInfo.resumeText || '').slice(0, MAX_RESUME_TEXT_CHARS);
+        if (resumeTextForLLM.length < String(candidateInfo.resumeText || '').length) {
+            console.log(`  简历内容过长，已截断到 ${MAX_RESUME_TEXT_CHARS} 字符后再调用LLM`);
+        }
+        const prompt = `你是一位专业的HR招聘助手，请根据以下筛选标准分析候选人简历，判断是否匹配。\n\n筛选标准:\n${criteria}\n\n简历内容:\n${resumeTextForLLM}\n\n请仔细分析简历，返回以下格式的JSON（必须是有效的JSON格式，不要包含任何其他内容）：\n{\n    "passed": true或false,\n    "reason": "通过或不通过的具体原因",\n    "summary": "简历摘要"\n}`;
 
         try {
             const content = await callLLM(prompt);
@@ -1482,48 +2566,76 @@ async function main() {
 
                     await sleep(humanDelay(200, 100));
 
-                    const canvasPosRaw = await cdp.send('Runtime.evaluate', { expression: jsGetFavoriteCanvasPosition, returnByValue: true });
-                    const canvasPos = parseResult(canvasPosRaw);
-                    
-                    if (canvasPos && canvasPos.success) {
-                        const offsetX = Math.floor(Math.random() * 7) - 3;
-                        const offsetY = Math.floor(Math.random() * 7) - 3;
-                        const clickX = canvasPos.absX + pos.canvasX + offsetX;
-                        const clickY = canvasPos.absY + pos.canvasY + offsetY;
-                        
-                        console.log(`  使用CDP鼠标轨迹点击收藏按钮 (${clickX}, ${clickY})...`);
-                        
-                        try {
-                            await simulateHumanClick(cdp, clickX, clickY);
-                            console.log('  CDP点击完成');
-                        } catch (e) {
-                            console.log(`  CDP点击失败: ${e.message}，回退到JS点击`);
-                            const favResultRaw = await cdp.send('Runtime.evaluate', { expression: jsClickFavorite(pos.pageX + offsetX, pos.pageY + offsetY), returnByValue: true });
-                            const favResult = parseResult(favResultRaw);
-                            if (!favResult || !favResult.success) {
-                                console.log(`  JS点击也失败: ${favResult?.error || 'unknown'}`);
-                                pendingFavoriteClick = false;
-                                break;
-                            }
+                    let usedDomFlow = false;
+                    const domStateRaw = await cdp.send('Runtime.evaluate', { expression: jsGetFavoriteDomState, returnByValue: true });
+                    const domState = parseResult(domStateRaw);
+                    if (domState && domState.success && domState.found && domState.alreadyInterested) {
+                        console.log('  DOM检测显示已是收藏状态，跳过点击');
+                        favoriteDone = true;
+                        pendingFavoriteClick = false;
+                        usedDomFlow = true;
+                    } else if (domState && domState.success && domState.found) {
+                        console.log('  优先使用DOM收藏按钮点击...');
+                        const domClickRaw = await cdp.send('Runtime.evaluate', { expression: jsClickFavoriteDom, returnByValue: true });
+                        const domClick = parseResult(domClickRaw);
+                        if (domClick && domClick.success && (domClick.clicked || domClick.alreadyInterested)) {
+                            usedDomFlow = true;
+                            console.log('  DOM点击已执行，等待状态确认...');
+                        } else {
+                            console.log(`  DOM点击失败，将回退legacy方案: ${domClick?.reason || 'unknown'}`);
                         }
                     } else {
-                        console.log(`  无法获取Canvas位置，使用校准坐标: ${canvasPos?.error || 'unknown'}`);
-                        const offsetX = Math.floor(Math.random() * 7) - 3;
-                        const offsetY = Math.floor(Math.random() * 7) - 3;
-                        const clickX = pos.pageX + offsetX;
-                        const clickY = pos.pageY + offsetY;
+                        console.log(`  DOM收藏按钮未就绪: ${domState?.reason || 'unknown'}`);
+                    }
+
+                    if (!usedDomFlow) {
+                        if (!pos) {
+                            pendingFavoriteClick = false;
+                            throw new Error('DOM收藏不可用且缺少可用校准文件，无法执行回退点击。请运行 boss-recruit-mcp calibrate 生成 favorite-calibration.json。');
+                        }
+                        const canvasPosRaw = await cdp.send('Runtime.evaluate', { expression: jsGetFavoriteCanvasPosition, returnByValue: true });
+                        const canvasPos = parseResult(canvasPosRaw);
                         
-                        try {
-                            await simulateHumanClick(cdp, clickX, clickY);
-                            console.log('  CDP点击完成');
-                        } catch (e) {
-                            console.log(`  CDP点击失败: ${e.message}，回退到JS点击`);
-                            const favResultRaw = await cdp.send('Runtime.evaluate', { expression: jsClickFavorite(clickX, clickY), returnByValue: true });
-                            const favResult = parseResult(favResultRaw);
-                            if (!favResult || !favResult.success) {
-                                console.log(`  JS点击也失败: ${favResult?.error || 'unknown'}`);
-                                pendingFavoriteClick = false;
-                                break;
+                        if (canvasPos && canvasPos.success) {
+                            const offsetX = Math.floor(Math.random() * 7) - 3;
+                            const offsetY = Math.floor(Math.random() * 7) - 3;
+                            const clickX = canvasPos.absX + pos.canvasX + offsetX;
+                            const clickY = canvasPos.absY + pos.canvasY + offsetY;
+                            
+                            console.log(`  使用CDP鼠标轨迹点击收藏按钮 (${clickX}, ${clickY})...`);
+                            
+                            try {
+                                await simulateHumanClick(cdp, clickX, clickY);
+                                console.log('  CDP点击完成');
+                            } catch (e) {
+                                console.log(`  CDP点击失败: ${e.message}，回退到JS点击`);
+                                const favResultRaw = await cdp.send('Runtime.evaluate', { expression: jsClickFavorite(pos.pageX + offsetX, pos.pageY + offsetY), returnByValue: true });
+                                const favResult = parseResult(favResultRaw);
+                                if (!favResult || !favResult.success) {
+                                    console.log(`  JS点击也失败: ${favResult?.error || 'unknown'}`);
+                                    pendingFavoriteClick = false;
+                                    break;
+                                }
+                            }
+                        } else {
+                            console.log(`  无法获取Canvas位置，使用校准坐标: ${canvasPos?.error || 'unknown'}`);
+                            const offsetX = Math.floor(Math.random() * 7) - 3;
+                            const offsetY = Math.floor(Math.random() * 7) - 3;
+                            const clickX = pos.pageX + offsetX;
+                            const clickY = pos.pageY + offsetY;
+                            
+                            try {
+                                await simulateHumanClick(cdp, clickX, clickY);
+                                console.log('  CDP点击完成');
+                            } catch (e) {
+                                console.log(`  CDP点击失败: ${e.message}，回退到JS点击`);
+                                const favResultRaw = await cdp.send('Runtime.evaluate', { expression: jsClickFavorite(clickX, clickY), returnByValue: true });
+                                const favResult = parseResult(favResultRaw);
+                                if (!favResult || !favResult.success) {
+                                    console.log(`  JS点击也失败: ${favResult?.error || 'unknown'}`);
+                                    pendingFavoriteClick = false;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1533,6 +2645,12 @@ async function main() {
                         await sleep(humanDelay(500, 150));
                         if (favoriteActionResult) {
                             waitResult = favoriteActionResult;
+                            break;
+                        }
+                        const domStateAfterRaw = await cdp.send('Runtime.evaluate', { expression: jsGetFavoriteDomState, returnByValue: true });
+                        const domStateAfter = parseResult(domStateAfterRaw);
+                        if (domStateAfter && domStateAfter.success && domStateAfter.found && domStateAfter.alreadyInterested) {
+                            waitResult = 'add';
                             break;
                         }
                     }
@@ -1570,6 +2688,9 @@ async function main() {
                 console.log(`  原因: ${reason}`);
             }
         } catch (e) {
+            if (e && typeof e.message === 'string' && e.message.includes('DOM收藏不可用且缺少可用校准文件')) {
+                throw e;
+            }
             console.log(`  LLM调用失败: ${e.message}`);
         }
 
@@ -1583,7 +2704,7 @@ async function main() {
             console.log('');
             console.log(`[随机休息] 10%概率触发，休息 ${Math.round(shortBreak/1000)} 秒...`);
             for (let i = 0; i < shortBreak; i += 1000) {
-                checkAndHandleSave();
+                await checkAndHandleSave();
                 await sleep(1000);
             }
             console.log('随机休息结束，继续筛选...');
@@ -1597,7 +2718,7 @@ async function main() {
             console.log(`已连续处理 ${consecutiveCount} 人，随机休息 ${breakMinutes} 分钟...`);
             console.log(`========================================`);
             for (let i = 0; i < breakTime; i += 1000) {
-                checkAndHandleSave();
+                await checkAndHandleSave();
                 await sleep(1000);
             }
             consecutiveCount = 0;
@@ -1627,6 +2748,9 @@ async function main() {
     }
 
     console.log('[6/6] 清理资源...');
+    if (typeof checkAndHandleSave.cleanup === 'function') {
+        checkAndHandleSave.cleanup();
+    }
     cdp.close();
 
     console.log('');
@@ -1643,6 +2767,11 @@ async function main() {
 }
 
 main().catch(e => {
-    console.error('Fatal error:', e);
+    if (process.stdin && process.stdin.isTTY) {
+        try {
+            process.stdin.setRawMode(false);
+        } catch {}
+    }
+    console.error('Fatal error:', e && e.message ? e.message : e);
     process.exit(1);
 });

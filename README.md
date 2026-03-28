@@ -84,7 +84,20 @@ $CODEX_HOME/boss-recruit-mcp/screening-config.json
 2. 填写以下字段：
 
 - `baseUrl` / `apiKey` / `model` 必填
+- OpenAI 推荐：
+  - `baseUrl`: `https://api.openai.com/v1`
+  - `apiKey`: OpenAI API Key
+  - `model`: 例如 `gpt-4.1-mini`
+- 也支持通过环境变量注入：
+  - `OPENAI_API_KEY`（可替代配置文件中的 `apiKey`）
+  - `OPENAI_BASE_URL`（可替代配置文件中的 `baseUrl`）
+  - `OPENAI_MODEL`（可替代配置文件中的 `model`）
+  - `OPENAI_ORG_ID` / `OPENAI_PROJECT_ID`（可选）
+- 配置文件可选字段：
+  - `openaiOrganization`
+  - `openaiProject`
 - `debugPort` 可选，默认 `9222`
+  - 端口优先级：`--port > BOSS_RECRUIT_CHROME_PORT > screening-config.json.debugPort > 9222`
 - `calibrationFile` 可选；不填时默认使用 `$CODEX_HOME/boss-recruit-mcp/favorite-calibration.json`
 - `outputDir` 可选；不填时默认输出到用户桌面
 - 学校标签支持 `统招本科` / `双一流院校` / `985` / `211` / `qs100` / `qs500`；如果输入 `qs50`、`qs200`、`qs500` 等其他 `QS数字`，会按 `<=100 -> qs100`、`>100 -> qs500` 归一
@@ -111,6 +124,12 @@ boss-recruit-mcp run --instruction "在 Boss 上找做过推荐系统的人，�
 boss-recruit-mcp run --instruction "在 Boss 上找做过推荐系统的人" --confirmation-json "{\"keyword_confirmed\":true,\"keyword_value\":\"推荐系统\",\"search_params_confirmed\":true}" --overrides-json "{\"city\":\"杭州\",\"degree\":\"本科\",\"schools\":[\"985\",\"211\",\"qs100\"],\"filter_recent_viewed\":true,\"target_count\":10}"
 ```
 
+PowerShell 下更推荐用文件方式，避免引号转义导致 `INVALID_CLI_INPUT`：
+
+```bash
+boss-recruit-mcp run --instruction-file request.txt --confirmation-file confirmation.json --overrides-file overrides.json
+```
+
 如果命令行中放长文本不方便，改用文件：
 
 ```bash
@@ -122,21 +141,26 @@ boss-recruit-mcp run --instruction-file request.txt --confirmation-file confirma
 
 ## Chrome 与校准
 
-先确认你要使用的 Chrome 远程调试端口。推荐 `9222`，但如果你已经有一个正在运行的远程调试 Chrome，也可以继续使用那个端口。确认端口后，再执行下面的命令。
+先确认你要使用的 Chrome 远程调试端口。推荐 `9222`，但如果你已经有一个正在运行的远程调试 Chrome，也可以继续使用那个端口。
 
-推荐先启动调试 Chrome：
+建议先固化一次端口（后续命令自动沿用）：
 
 ```bash
-boss-recruit-mcp launch-chrome --port <port>
+boss-recruit-mcp set-port --port <port>
 ```
 
-`launch-chrome` 会自动为该端口创建独立的 Chrome profile 目录，避免复用已有 Chrome 实例导致调试端口未生效。
-命令还会检查新打开的 Boss 页面是否仍停留在 `search` 页面；如果跳转到了登录页或其他页面，说明需要用户先手动登录 Boss。
+确认端口后，再执行下面的命令。
 
-然后执行校准：
+执行校准（会自动尝试打开 Boss 搜索页）：
 
 ```bash
 boss-recruit-mcp calibrate --port <port>
+```
+
+如果你想自定义监听窗口（默认 60 秒）：
+
+```bash
+boss-recruit-mcp calibrate --port <port> --timeout-ms 60000
 ```
 
 如果你的 `screening-config.json` 里配置了自定义 `calibrationFile` 路径，而该路径当前不存在，直接把校准结果输出到那个路径：
@@ -164,6 +188,8 @@ $CODEX_HOME/boss-recruit-mcp/favorite-calibration.json
 也可以用下面的命令检查依赖、配置和校准文件：
 
 ```bash
+boss-recruit-mcp doctor
+# 或显式指定
 boss-recruit-mcp doctor --port <port>
 ```
 
@@ -199,6 +225,34 @@ boss-recruit-mcp doctor --port <port>
 - 若缺少 `favorite-calibration.json`，会返回 `CALIBRATION_REQUIRED`
 - 若当前运行环境不允许启动子进程，会返回更明确的权限错误码而不是笼统失败
 - 配置文件查找顺序：`BOSS_RECRUIT_SCREEN_CONFIG` > 工作区 `boss-recruit-mcp/config/screening-config.json` > 用户目录 `$CODEX_HOME/boss-recruit-mcp/screening-config.json` > 包内示例配置
+
+## 终版测试方案
+
+回归脚本位置：`scripts/regression.ps1`
+
+1. 快速回归（不依赖 Boss 页面，验证 CLI 输入与状态机基础逻辑）：
+
+```bash
+npm run test:regression:win
+```
+
+2. 全链路回归（依赖 Chrome 调试端口 + 已登录 Boss）：
+
+```bash
+powershell -ExecutionPolicy Bypass -File scripts/regression.ps1 -Mode full -Port 9222
+```
+
+3. 负向回归（错误端口，确保不会误返回 `COMPLETED`）：
+
+```bash
+powershell -ExecutionPolicy Bypass -File scripts/regression.ps1 -Mode negative
+```
+
+判定标准：
+
+- 不应出现 `INVALID_CLI_INPUT`
+- 正常场景允许 `COMPLETED` 或可诊断的 `FAILED`
+- 错误端口场景必须是 `FAILED`，且不是参数解析类错误
 
 ## 发布
 

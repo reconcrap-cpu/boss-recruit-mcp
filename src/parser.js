@@ -240,8 +240,6 @@ function buildScreenCriteria(text, searchParams) {
   const filtered = clauses.filter((clause) => {
     if (/搜索关键词|关键词|keyword/i.test(clause)) return false;
     if (/地点|城市/.test(clause)) return false;
-    if (/学历|本科|硕士|博士/.test(clause) && !/论文|项目|经验/.test(clause)) return false;
-    if (/985|211|qs\s*\d+|双一流|统招(?:本科)?|院校/i.test(clause) && !/论文|经验|项目/.test(clause)) return false;
     if (/近?14天(?:内)?查看(?:过)?|过滤近14天查看/.test(clause)) return false;
     if (isCountPlanningClause(clause)) return false;
     return true;
@@ -460,8 +458,10 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
   );
   const suspicious_fields = collectSuspiciousFields(searchParams, screenParams);
   const needs_recent_viewed_filter_confirmation = searchParams.filter_recent_viewed === null;
-  const pending_questions = needs_recent_viewed_filter_confirmation
-    ? [
+  const needs_criteria_confirmation = confirmation?.criteria_confirmed !== true;
+  const pending_questions = [
+    ...(needs_recent_viewed_filter_confirmation
+      ? [
       {
         field: "filter_recent_viewed",
         question: "是否需要过滤近14天查看过的人选？",
@@ -471,7 +471,17 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
         ]
       }
     ]
-    : [];
+      : []),
+    ...(needs_criteria_confirmation
+      ? [
+        {
+          field: "criteria",
+          question: "请确认筛选 criteria 是否准确无误（尤其是硬性约束条件）？",
+          value: baseScreenParams.criteria
+        }
+      ]
+      : [])
+  ];
 
   return {
     parsed,
@@ -482,6 +492,7 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
     suspicious_fields,
     needs_keyword_confirmation: keywordResolution.needsConfirmation,
     needs_recent_viewed_filter_confirmation,
+    needs_criteria_confirmation,
     needs_search_params_confirmation: confirmation?.search_params_confirmed !== true,
     proposed_keyword: keywordResolution.proposedKeyword,
     pending_questions,

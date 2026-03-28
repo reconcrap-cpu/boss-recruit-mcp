@@ -12,7 +12,9 @@ import { runRecruitPipeline } from "./pipeline.js";
 const require = createRequire(import.meta.url);
 const currentFilePath = fileURLToPath(import.meta.url);
 const packageRoot = path.resolve(path.dirname(currentFilePath), "..");
-const skillSourceDir = path.join(packageRoot, "skills", "boss-recruit-pipeline");
+const packageJsonPath = path.join(packageRoot, "package.json");
+const skillName = "boss-recruit-pipeline";
+const skillSourceDir = path.join(packageRoot, "skills", skillName);
 const exampleConfigPath = path.join(packageRoot, "config", "screening-config.example.json");
 const calibrationScriptPath = path.join(
   packageRoot,
@@ -25,6 +27,29 @@ const SUPPORTED_MCP_CLIENTS = ["generic", "cursor", "trae", "claudecode", "openc
 const DEFAULT_MCP_SERVER_NAME = "boss-recruit";
 const DEFAULT_MCP_COMMAND = "npx";
 const DEFAULT_MCP_ARGS = ["-y", "@reconcrap/boss-recruit-mcp@latest", "start"];
+const AUTO_SYNC_SKIP_COMMANDS = new Set([
+  "install",
+  "install-skill",
+  "where",
+  "help",
+  "--help",
+  "-h"
+]);
+
+function getPackageVersion() {
+  try {
+    const raw = fs.readFileSync(packageJsonPath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (typeof parsed?.version === "string" && parsed.version.trim()) {
+      return parsed.version.trim();
+    }
+  } catch {
+    // Fallback below.
+  }
+  return "0.0.0";
+}
+
+const packageVersion = getPackageVersion();
 
 function getCodexHome() {
   return process.env.CODEX_HOME
@@ -46,6 +71,30 @@ function getUserConfigPath() {
 
 function getUserCalibrationPath() {
   return path.join(getCodexHome(), "boss-recruit-mcp", "favorite-calibration.json");
+}
+
+function getSkillTargetDir() {
+  return path.join(getCodexHome(), "skills", skillName);
+}
+
+function getSkillVersionMarkerPath() {
+  return path.join(getSkillTargetDir(), ".installed-version");
+}
+
+function readInstalledSkillVersion() {
+  const markerPath = getSkillVersionMarkerPath();
+  if (!fs.existsSync(markerPath)) return null;
+  try {
+    return fs.readFileSync(markerPath, "utf8").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function writeInstalledSkillVersion(version) {
+  const markerPath = getSkillVersionMarkerPath();
+  ensureDir(path.dirname(markerPath));
+  fs.writeFileSync(markerPath, `${version}\n`, "utf8");
 }
 
 function getChromeUserDataDir(port, options = {}) {
@@ -194,10 +243,53 @@ function parseJsonOption(value, label) {
     return undefined;
   }
 
+  const raw = String(value).replace(/^\uFEFF/, "").trim();
+  const normalizedQuotes = raw
+    .replace(/[“”]/g, "\"")
+    .replace(/[‘’]/g, "'");
+
+  const candidates = [];
+  const pushCandidate = (item) => {
+    if (typeof item === "string" && item.trim()) {
+      candidates.push(item.trim());
+    }
+  };
+
+  pushCandidate(raw);
+  if (normalizedQuotes !== raw) {
+    pushCandidate(normalizedQuotes);
+  }
+  if (
+    normalizedQuotes.length >= 2
+    && normalizedQuotes.startsWith("'")
+    && normalizedQuotes.endsWith("'")
+  ) {
+    pushCandidate(normalizedQuotes.slice(1, -1));
+  }
+
+  let lastError = null;
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate);
+    } catch (error) {
+      lastError = error;
+      try {
+        const unwrapped = JSON.parse(candidate);
+        if (typeof unwrapped === "string") {
+          return JSON.parse(unwrapped);
+        }
+      } catch {
+        // Continue trying next candidate.
+      }
+    }
+  }
+
   try {
-    return JSON.parse(String(value));
+    return JSON.parse(raw);
   } catch (error) {
-    throw new Error(`Invalid ${label} JSON: ${error.message}`);
+    const hint = "Tip: in PowerShell prefer --*-file or wrap JSON with single quotes.";
+    const reason = lastError?.message || error.message;
+    throw new Error(`Invalid ${label} JSON: ${reason}. ${hint}`);
   }
 }
 
@@ -239,6 +331,99 @@ function getRunOverrides(options) {
 function getWorkspaceRoot(options) {
   const raw = options["workspace-root"] || process.env.BOSS_WORKSPACE_ROOT || process.cwd();
   return path.resolve(String(raw));
+}
+
+function parsePositivePort(raw) {
+  const port = Number.parseInt(String(raw || ""), 10);
+  return Number.isFinite(port) && port > 0 ? port : null;
+}
+
+function getActiveScreenConfigPath(workspaceRoot) {
+  const preflight = runPipelinePreflight(workspaceRoot);
+  const screenConfigCheck = preflight.checks.find((item) => item.key === "screen_config");
+  if (screenConfigCheck?.path) {
+    return path.resolve(screenConfigCheck.path);
+  }
+  return getUserConfigPath();
+}
+
+function readJsonObjectFile(filePath) {
+  const raw = fs.readFileSync(filePath, "utf8");
+  const parsed = JSON.parse(raw);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Config content must be a JSON object");
+  }
+  return parsed;
+}
+
+function readDebugPortFromConfigPath(configPath) {
+  try {
+    if (!fs.existsSync(configPath)) return null;
+    const parsed = readJsonObjectFile(configPath);
+    return parsePositivePort(parsed.debugPort);
+  } catch {
+    return null;
+  }
+}
+
+function persistDebugPortSelection(port, options = {}) {
+  const workspaceRoot = getWorkspaceRoot(options);
+  const configPath = getActiveScreenConfigPath(workspaceRoot);
+  const existed = fs.existsSync(configPath);
+  let config = {};
+
+  if (existed) {
+    config = readJsonObjectFile(configPath);
+  }
+
+  config.debugPort = port;
+  ensureDir(path.dirname(configPath));
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2), "utf8");
+
+  return {
+    port,
+    configPath,
+    existed
+  };
+}
+
+function applyExplicitPortSelection(options = {}, extras = {}) {
+  const selected = parsePositivePort(options.port);
+  if (!selected) return null;
+
+  process.env.BOSS_RECRUIT_CHROME_PORT = String(selected);
+  if (!extras.persist) return { port: selected, persisted: false };
+
+  try {
+    const persisted = persistDebugPortSelection(selected, options);
+    return {
+      port: selected,
+      persisted: true,
+      configPath: persisted.configPath
+    };
+  } catch (error) {
+    return {
+      port: selected,
+      persisted: false,
+      error: error.message
+    };
+  }
+}
+
+function setDebugPort(options = {}) {
+  const selected = parsePositivePort(options.port);
+  if (!selected) {
+    throw new Error("Missing required --port <number> for set-port.");
+  }
+
+  process.env.BOSS_RECRUIT_CHROME_PORT = String(selected);
+  const result = persistDebugPortSelection(selected, options);
+
+  return {
+    port: selected,
+    configPath: result.configPath,
+    existed: result.existed
+  };
 }
 
 function printJson(value) {
@@ -345,6 +530,29 @@ async function inspectBossPageState(port, options = {}) {
   });
 }
 
+async function openBossSearchTab(port) {
+  const endpoint = `http://127.0.0.1:${port}/json/new?${encodeURIComponent(bossUrl)}`;
+  const attempts = ["PUT", "GET"];
+  let lastError = null;
+
+  for (const method of attempts) {
+    try {
+      const response = await fetch(endpoint, { method });
+      if (response.ok) {
+        return { ok: true, method };
+      }
+      lastError = new Error(`DevTools /json/new returned ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  return {
+    ok: false,
+    error: lastError?.message || "Failed to open Boss search tab via DevTools /json/new"
+  };
+}
+
 function hasModule(moduleName) {
   try {
     require.resolve(moduleName);
@@ -355,9 +563,27 @@ function hasModule(moduleName) {
 }
 
 function getDebugPort(options = {}) {
-  const raw = options.port || process.env.BOSS_RECRUIT_CHROME_PORT || "9222";
-  const port = Number.parseInt(String(raw), 10);
-  return Number.isFinite(port) && port > 0 ? port : 9222;
+  const fromOption = parsePositivePort(options.port);
+  if (fromOption) return fromOption;
+
+  const fromEnv = parsePositivePort(process.env.BOSS_RECRUIT_CHROME_PORT);
+  if (fromEnv) return fromEnv;
+
+  const workspaceRoot = getWorkspaceRoot(options);
+  const configPath = getActiveScreenConfigPath(workspaceRoot);
+  const fromConfig = readDebugPortFromConfigPath(configPath);
+  if (fromConfig) return fromConfig;
+
+  return 9222;
+}
+
+function getCalibrationTimeoutMs(options = {}) {
+  const raw = options["timeout-ms"] || options.timeoutMs || options.timeout || "60000";
+  const timeout = Number.parseInt(String(raw), 10);
+  if (!Number.isFinite(timeout) || timeout <= 0) {
+    return 60000;
+  }
+  return Math.max(5000, timeout);
 }
 
 function getChromeExecutable() {
@@ -384,12 +610,35 @@ function runNodeScript(scriptPath, args) {
   });
 }
 
-function installSkill() {
-  const codexHome = getCodexHome();
-  const targetDir = path.join(codexHome, "skills", "boss-recruit-pipeline");
+function syncSkillAssets(options = {}) {
+  const force = options.force === true;
+  const targetDir = getSkillTargetDir();
+  const skillEntry = path.join(targetDir, "SKILL.md");
+  const installedVersion = readInstalledSkillVersion();
+  const needsSync = force || !fs.existsSync(skillEntry) || installedVersion !== packageVersion;
+  if (!needsSync) {
+    return { targetDir, updated: false, installedVersion, packageVersion };
+  }
   ensureDir(path.dirname(targetDir));
   fs.cpSync(skillSourceDir, targetDir, { recursive: true, force: true });
-  return targetDir;
+  writeInstalledSkillVersion(packageVersion);
+  return { targetDir, updated: true, installedVersion, packageVersion };
+}
+
+function installSkill() {
+  const result = syncSkillAssets({ force: true });
+  return result.targetDir;
+}
+
+function ensureAssetsUpToDate(command) {
+  if (AUTO_SYNC_SKIP_COMMANDS.has(command)) {
+    return;
+  }
+  try {
+    syncSkillAssets({ force: false });
+  } catch {
+    // Keep runtime commands stable even if asset sync fails.
+  }
 }
 
 function ensureUserConfig() {
@@ -406,8 +655,10 @@ function ensureUserConfig() {
 }
 
 async function printDoctor(options) {
+  applyExplicitPortSelection(options, { persist: true });
   const port = getDebugPort(options);
-  const checks = runPipelinePreflight(process.cwd()).checks.slice();
+  const workspaceRoot = getWorkspaceRoot(options);
+  const checks = runPipelinePreflight(workspaceRoot).checks.slice();
   const pageState = await inspectBossPageState(port, { timeoutMs: 2000, pollMs: 500 });
   const userConfigPath = getUserConfigPath();
   checks.push({
@@ -448,67 +699,165 @@ async function printDoctor(options) {
 }
 
 async function calibrate(options) {
+  applyExplicitPortSelection(options, { persist: true });
   const port = getDebugPort(options);
   const output = options.output ? path.resolve(String(options.output)) : getUserCalibrationPath();
-  console.log("Before calibration:");
-  console.log("1. Open Boss search page.");
-  console.log("2. Open any candidate detail page.");
-  console.log("3. Click the favorite button once.");
-  console.log("4. Click again to cancel favorite for that candidate.");
-  console.log("5. Close the detail page after calibration completes.");
+  const timeoutMs = getCalibrationTimeoutMs(options);
+
+  console.log("Calibration checklist:");
+  console.log("1. The tool will auto-open Boss search page now.");
+  console.log("2. Open any candidate detail page in that Boss window.");
+  console.log("3. Click favorite once, then click again to unfavorite.");
+  console.log("4. Close the detail page.");
+  console.log(`5. The calibration listener will wait for ${Math.round(timeoutMs / 1000)} seconds.`);
   console.log("");
+
+  let launchResult = null;
+  const preState = await inspectBossPageState(port, { timeoutMs: 2000, pollMs: 500 });
+  if (preState.state === "DEBUG_PORT_UNREACHABLE") {
+    launchResult = await launchChrome(options);
+    if (process.exitCode && process.exitCode !== 0) {
+      return;
+    }
+  } else {
+    console.log(`Detected existing Chrome debug instance on port ${port}; calibration will reuse it.`);
+    let pageState = preState;
+    if (pageState.state !== "SEARCH_READY") {
+      const openResult = await openBossSearchTab(port);
+      if (openResult.ok) {
+        console.log(
+          `Requested Boss search tab via DevTools /json/new (${openResult.method}) before calibration`
+        );
+      } else {
+        console.log(
+          `Could not request Boss search tab via DevTools /json/new before calibration: ${openResult.error}`
+        );
+      }
+      pageState = await inspectBossPageState(port, { timeoutMs: 6000, pollMs: 1000 });
+    }
+    launchResult = {
+      ok: pageState.state === "SEARCH_READY",
+      state: pageState.state,
+      pageState,
+      reused_existing_instance: true
+    };
+  }
+
+  if (launchResult?.state === "LOGIN_REQUIRED") {
+    console.log("Boss page requires login. Please log in in the opened Chrome window, then complete the checklist within the listener window.");
+  } else if (launchResult?.state === "SEARCH_READY") {
+    console.log("Boss search page is ready. Start the checklist now.");
+  } else {
+    console.log("Proceeding with calibration listener. If no click is captured, retry after ensuring Boss search page is open.");
+  }
+  console.log("");
+
   const code = await runNodeScript(calibrationScriptPath, [
     "--port",
     String(port),
     "--output",
-    output
+    output,
+    "--timeout-ms",
+    String(timeoutMs)
   ]);
   process.exitCode = code;
 }
 
 async function launchChrome(options) {
-  const chromePath = getChromeExecutable();
-  if (!chromePath) {
-    console.error("Chrome executable not found. Set BOSS_RECRUIT_CHROME_PATH or install Google Chrome.");
-    process.exitCode = 1;
-    return;
-  }
+  applyExplicitPortSelection(options, { persist: true });
   const port = getDebugPort(options);
-  const userDataDir = getChromeUserDataDir(port, options);
-  const args = [
-    `--remote-debugging-port=${port}`,
-    `--user-data-dir=${userDataDir}`,
-    "--new-window",
-    bossUrl
-  ];
-  const child = spawn(chromePath, args, {
-    detached: true,
-    stdio: "ignore",
-    windowsHide: false
-  });
-  child.unref();
-  console.log(`Chrome launched with remote debugging port ${port}`);
-  console.log(`User data dir: ${userDataDir}`);
-  console.log(`URL: ${bossUrl}`);
+  const initialState = await inspectBossPageState(port, { timeoutMs: 2000, pollMs: 500 });
+  let usedExistingInstance = initialState.state !== "DEBUG_PORT_UNREACHABLE";
 
-  const pageState = await inspectBossPageState(port, { timeoutMs: 12000, pollMs: 1000 });
+  if (usedExistingInstance) {
+    console.log(`Reusing existing Chrome debug instance on port ${port}`);
+
+    if (initialState.state !== "SEARCH_READY") {
+      const openResult = await openBossSearchTab(port);
+      if (openResult.ok) {
+        console.log(
+          `Requested Boss search tab via DevTools /json/new (${openResult.method}) on port ${port}`
+        );
+      } else {
+        console.log(
+          `Could not request Boss search tab via DevTools /json/new: ${openResult.error}`
+        );
+      }
+    }
+  } else {
+    const chromePath = getChromeExecutable();
+    if (!chromePath) {
+      console.error("Chrome executable not found. Set BOSS_RECRUIT_CHROME_PATH or install Google Chrome.");
+      process.exitCode = 1;
+      return { ok: false, state: "CHROME_NOT_FOUND" };
+    }
+
+    const userDataDir = getChromeUserDataDir(port, options);
+    const args = [
+      `--remote-debugging-port=${port}`,
+      `--user-data-dir=${userDataDir}`,
+      "--new-window",
+      bossUrl
+    ];
+    const child = spawn(chromePath, args, {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: false
+    });
+    child.unref();
+    console.log(`Chrome launched with remote debugging port ${port}`);
+    console.log(`User data dir: ${userDataDir}`);
+    console.log(`URL: ${bossUrl}`);
+  }
+
+  let pageState = await inspectBossPageState(port, { timeoutMs: 12000, pollMs: 1000 });
+  if (pageState.state === "BOSS_TAB_NOT_FOUND") {
+    const openResult = await openBossSearchTab(port);
+    if (openResult.ok) {
+      console.log(`Requested Boss search tab via DevTools /json/new (${openResult.method})`);
+      pageState = await inspectBossPageState(port, { timeoutMs: 6000, pollMs: 1000 });
+    } else {
+      console.log(`Could not request Boss search tab via DevTools /json/new: ${openResult.error}`);
+    }
+  }
+
   if (pageState.state === "SEARCH_READY") {
     console.log("Boss search page is ready.");
     console.log(`Current URL: ${pageState.current_url}`);
-    return;
+    return {
+      ok: true,
+      state: "SEARCH_READY",
+      pageState,
+      reused_existing_instance: usedExistingInstance
+    };
   }
 
   if (pageState.state === "LOGIN_REQUIRED") {
     console.log("Boss page redirected away from search. Manual login is required.");
     console.log(`Current URL: ${pageState.current_url}`);
     console.log("Please log in to Boss manually in the opened Chrome window, then tell the AI agent to continue.");
-    return;
+    return {
+      ok: false,
+      state: "LOGIN_REQUIRED",
+      pageState,
+      reused_existing_instance: usedExistingInstance
+    };
   }
 
+  if (usedExistingInstance && pageState.state === "DEBUG_PORT_UNREACHABLE") {
+    // Existing instance may have been closed while launching; surface it clearly.
+    usedExistingInstance = false;
+  }
   console.log(pageState.message);
   if (pageState.current_url) {
     console.log(`Current URL: ${pageState.current_url}`);
   }
+  return {
+    ok: false,
+    state: pageState.state || "UNKNOWN",
+    pageState,
+    reused_existing_instance: usedExistingInstance
+  };
 }
 
 function printHelp() {
@@ -521,15 +870,22 @@ function printHelp() {
   console.log("  boss-recruit-mcp install      Install Codex skill and initialize user config");
   console.log("  boss-recruit-mcp install-skill Install only the Codex skill");
   console.log("  boss-recruit-mcp init-config  Create ~/.codex/boss-recruit-mcp/screening-config.json if missing");
+  console.log("  boss-recruit-mcp set-port     Persist preferred Chrome debug port to active screening-config");
   console.log("  boss-recruit-mcp mcp-config   Generate MCP config JSON for Cursor/Trae/Claude Code/OpenClaw");
   console.log("  boss-recruit-mcp doctor       Check config, calibration, and runtime prerequisites");
-  console.log("  boss-recruit-mcp calibrate    Run favorite-button calibration and save favorite-calibration.json");
-  console.log("  boss-recruit-mcp launch-chrome Launch Chrome in remote-debugging mode, open Boss search, and check login state");
+  console.log("  boss-recruit-mcp calibrate    Auto-open Boss search page, then run favorite-button calibration");
+  console.log("  boss-recruit-mcp launch-chrome Reuse existing Chrome debug instance when possible; otherwise launch one, open Boss search, and check login state");
   console.log("  boss-recruit-mcp where        Print installed package, skill, and config paths");
   console.log("");
   console.log("Run command:");
   console.log("  boss-recruit-mcp run --instruction \"找杭州本科做过推荐系统的人\" [--confirmation-json '{...}'] [--overrides-json '{...}']");
   console.log("  boss-recruit-mcp run --instruction-file request.txt [--confirmation-file confirmation.json] [--overrides-file overrides.json]");
+  console.log("");
+  console.log("Calibration command:");
+  console.log("  boss-recruit-mcp calibrate --port 9222 [--timeout-ms 60000] [--output <path>]");
+  console.log("");
+  console.log("Port command:");
+  console.log("  boss-recruit-mcp set-port --port 19222");
   console.log("");
   console.log("MCP config command:");
   console.log("  boss-recruit-mcp mcp-config --client cursor");
@@ -586,13 +942,15 @@ function installAll() {
   console.log("1. Fill in baseUrl/apiKey/model in the config file above.");
   console.log("2. Choose a client template from the exported MCP config files and merge it into your AI client config.");
   console.log("3. Choose a Chrome remote-debugging port (9222 is recommended, but you can reuse an existing port).");
-  console.log("4. Run `boss-recruit-mcp doctor --port <your-port>` to verify config, calibration, and runtime prerequisites.");
-  console.log("5. Run `boss-recruit-mcp launch-chrome --port <your-port>`; if it reports the page redirected away from search, log in to Boss manually in that Chrome window.");
-  console.log("6. Run `boss-recruit-mcp calibrate --port <your-port>` to generate favorite-calibration.json for this environment.");
-  console.log("7. Run `boss-recruit-mcp start` or configure your MCP client to launch the command from the generated template.");
+  console.log("4. Run `boss-recruit-mcp set-port --port <your-port>` once to persist your chosen port for all later commands.");
+  console.log("5. Run `boss-recruit-mcp doctor` (or `boss-recruit-mcp doctor --port <your-port>`) to verify config, calibration, and runtime prerequisites.");
+  console.log("6. Run `boss-recruit-mcp launch-chrome` (or `--port <your-port>`); if it reports the page redirected away from search, log in to Boss manually in that Chrome window.");
+  console.log("7. Run `boss-recruit-mcp calibrate` (or `--port <your-port>`) to generate favorite-calibration.json for this environment.");
+  console.log("8. Run `boss-recruit-mcp start` or configure your MCP client to launch the command from the generated template.");
 }
 
 async function runPipelineOnce(options) {
+  applyExplicitPortSelection(options, { persist: true });
   const instruction = getRunInstruction(options);
   const confirmation = getRunConfirmation(options);
   const overrides = getRunOverrides(options);
@@ -610,6 +968,7 @@ async function runPipelineOnce(options) {
 
 const command = process.argv[2] || "start";
 const options = parseOptions(process.argv.slice(3));
+ensureAssetsUpToDate(command);
 
 switch (command) {
   case "start":
@@ -643,6 +1002,18 @@ switch (command) {
         ? `Config template created at: ${result.path}`
         : `Config already exists at: ${result.path}`
     );
+    break;
+  }
+  case "set-port": {
+    try {
+      const result = setDebugPort(options);
+      console.log(`Preferred debug port saved: ${result.port}`);
+      console.log(`Updated config: ${result.configPath}`);
+      console.log("Port priority for runtime commands: --port > BOSS_RECRUIT_CHROME_PORT > screening-config.json.debugPort > 9222");
+    } catch (error) {
+      console.error(error.message || "Failed to persist debug port.");
+      process.exitCode = 1;
+    }
     break;
   }
   case "mcp-config":

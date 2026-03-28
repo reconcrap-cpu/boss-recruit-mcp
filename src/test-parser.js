@@ -11,6 +11,7 @@ function testNeedInput() {
   assert.equal(r.needs_keyword_confirmation, true);
   assert.equal(r.needs_search_params_confirmation, true);
   assert.equal(r.needs_recent_viewed_filter_confirmation, true);
+  assert.equal(r.needs_criteria_confirmation, true);
   assert.equal(r.proposed_keyword?.toLowerCase(), "ai infra");
   assert.deepEqual(
     r.default_preview,
@@ -46,7 +47,8 @@ function testExampleExtraction() {
     confirmation: {
       keyword_confirmed: true,
       keyword_value: "ai infra",
-      search_params_confirmed: true
+      search_params_confirmed: true,
+      criteria_confirmed: true
     },
     overrides: {
       filter_recent_viewed: false
@@ -56,6 +58,7 @@ function testExampleExtraction() {
   assert.equal(confirmed.needs_keyword_confirmation, false);
   assert.equal(confirmed.needs_search_params_confirmation, false);
   assert.equal(confirmed.needs_recent_viewed_filter_confirmation, false);
+  assert.equal(confirmed.needs_criteria_confirmation, false);
   assert.equal(confirmed.searchParams.keyword, "ai infra");
   assert.equal(confirmed.searchParams.filter_recent_viewed, false);
   assert.equal(confirmed.missing_fields.length, 0);
@@ -78,7 +81,8 @@ function testStructuredInputAndCriteriaCleanup() {
     confirmation: {
       keyword_confirmed: true,
       keyword_value: "AI infra",
-      search_params_confirmed: true
+      search_params_confirmed: true,
+      criteria_confirmed: true
     },
     overrides: {
       filter_recent_viewed: false
@@ -91,8 +95,31 @@ function testStructuredInputAndCriteriaCleanup() {
   assert.equal(r.screenParams.target_count, 10);
   assert.equal(
     r.screenParams.criteria,
-    "做过AI infra；必须发表过CCF-A区论文"
+    "做过AI infra；必须发表过CCF-A区论文；学历：本科；学校：985、211、qs100"
   );
+}
+
+function testDegreeAndSchoolConstraintsRetainedInCriteria() {
+  const r = parseRecruitInstruction({
+    instruction: "找算法相关人选，本科学历必须是985，目标人数10人",
+    confirmation: {
+      keyword_confirmed: true,
+      keyword_value: "算法",
+      search_params_confirmed: true,
+      criteria_confirmed: true
+    },
+    overrides: {
+      degree: "本科",
+      schools: ["985"],
+      filter_recent_viewed: false
+    }
+  });
+
+  assert.equal(r.searchParams.degree, "本科");
+  assert.deepEqual(r.searchParams.schools, ["985院校"]);
+  assert.equal(r.searchParams.filter_recent_viewed, false);
+  assert.equal(r.screenParams.target_count, 10);
+  assert.match(r.screenParams.criteria, /本科学历必须是985/);
 }
 
 function testSchoolAliasesAndQsBuckets() {
@@ -101,7 +128,8 @@ function testSchoolAliasesAndQsBuckets() {
     confirmation: {
       keyword_confirmed: true,
       keyword_value: "推荐系统",
-      search_params_confirmed: true
+      search_params_confirmed: true,
+      criteria_confirmed: true
     },
     overrides: null
   });
@@ -117,7 +145,8 @@ function testSchoolAliasesAndQsBuckets() {
     confirmation: {
       keyword_confirmed: true,
       keyword_value: "推荐系统",
-      search_params_confirmed: true
+      search_params_confirmed: true,
+      criteria_confirmed: true
     },
     overrides: {
       schools: ["qs50", "qs500", "211", "双一流学校", "统招本"],
@@ -139,7 +168,8 @@ function testPlanningClausesRemovedAndMasterDegreeParsed() {
     confirmation: {
       keyword_confirmed: true,
       keyword_value: "算法",
-      search_params_confirmed: true
+      search_params_confirmed: true,
+      criteria_confirmed: true
     },
     overrides: {
       schools: ["985院校", "211院校", "QS200"],
@@ -154,7 +184,7 @@ function testPlanningClausesRemovedAndMasterDegreeParsed() {
   assert.equal(r.screenParams.target_count, 5);
   assert.equal(
     r.screenParams.criteria,
-    "候选人需有算法相关经历；再按硬性要求筛选：简历中明确出现 CCF-A 类会议或期刊论文"
+    "候选人需有算法相关经历；学历硕士；学校标签：985、211、QS200；再按硬性要求筛选：简历中明确出现 CCF-A 类会议或期刊论文"
   );
 }
 
@@ -169,6 +199,7 @@ function testCitySanitizationAndConfirmationGate() {
   assert.equal(r.searchParams.city, "杭州");
   assert.equal(r.needs_search_params_confirmation, true);
   assert.equal(r.needs_recent_viewed_filter_confirmation, true);
+  assert.equal(r.needs_criteria_confirmation, true);
   assert.equal(r.suspicious_fields.length, 0);
 }
 
@@ -179,7 +210,8 @@ function testDefaultsCanOnlyApplyWhenExplicitlyRequested() {
       keyword_confirmed: true,
       keyword_value: "推荐系统",
       use_default_for_missing: true,
-      search_params_confirmed: true
+      search_params_confirmed: true,
+      criteria_confirmed: true
     },
     overrides: null
   });
@@ -203,7 +235,8 @@ function testRecentViewedFilterPromptAndNegativeOverride() {
     confirmation: {
       keyword_confirmed: true,
       keyword_value: "推荐系统",
-      search_params_confirmed: true
+      search_params_confirmed: true,
+      criteria_confirmed: true
     },
     overrides: null
   });
@@ -225,7 +258,8 @@ function testRecentViewedFilterPromptAndNegativeOverride() {
     confirmation: {
       keyword_confirmed: true,
       keyword_value: "推荐系统",
-      search_params_confirmed: true
+      search_params_confirmed: true,
+      criteria_confirmed: true
     },
     overrides: null
   });
@@ -234,16 +268,52 @@ function testRecentViewedFilterPromptAndNegativeOverride() {
   assert.equal(explicitNo.searchParams.filter_recent_viewed, false);
 }
 
+function testCriteriaConfirmationPrompt() {
+  const needsCriteriaConfirm = parseRecruitInstruction({
+    instruction: "帮我找杭州本科做过算法的人，学校 985，目标人数 10 人，必须有 CCF-A 会议论文",
+    confirmation: {
+      keyword_confirmed: true,
+      keyword_value: "算法",
+      search_params_confirmed: true
+    },
+    overrides: {
+      filter_recent_viewed: false
+    }
+  });
+
+  assert.equal(needsCriteriaConfirm.needs_criteria_confirmation, true);
+  assert.ok(
+    needsCriteriaConfirm.pending_questions.some((item) => item.field === "criteria")
+  );
+
+  const confirmedCriteria = parseRecruitInstruction({
+    instruction: "帮我找杭州本科做过算法的人，学校 985，目标人数 10 人，必须有 CCF-A 会议论文",
+    confirmation: {
+      keyword_confirmed: true,
+      keyword_value: "算法",
+      search_params_confirmed: true,
+      criteria_confirmed: true
+    },
+    overrides: {
+      filter_recent_viewed: false
+    }
+  });
+
+  assert.equal(confirmedCriteria.needs_criteria_confirmation, false);
+}
+
 function main() {
   testNeedInput();
   testExampleExtraction();
   testMissingFieldsBatch();
   testStructuredInputAndCriteriaCleanup();
+  testDegreeAndSchoolConstraintsRetainedInCriteria();
   testSchoolAliasesAndQsBuckets();
   testPlanningClausesRemovedAndMasterDegreeParsed();
   testCitySanitizationAndConfirmationGate();
   testDefaultsCanOnlyApplyWhenExplicitlyRequested();
   testRecentViewedFilterPromptAndNegativeOverride();
+  testCriteriaConfirmationPrompt();
   // eslint-disable-next-line no-console
   console.log("parser tests passed");
 }

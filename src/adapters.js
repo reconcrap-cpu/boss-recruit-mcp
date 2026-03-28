@@ -49,6 +49,11 @@ function pathExists(targetPath) {
   }
 }
 
+function parsePositiveInteger(raw) {
+  const value = Number.parseInt(String(raw || ""), 10);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
 function resolveSearchCliDir(workspaceRoot) {
   const localDir = path.join(workspaceRoot, "boss-search-cli");
   if (pathExists(localDir)) {
@@ -190,35 +195,43 @@ function loadScreenConfig(configPath) {
   }
 }
 
-function resolveDebugPort(config) {
-  const fromEnv = Number.parseInt(process.env.BOSS_RECRUIT_CHROME_PORT || "", 10);
-  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
-  const fromConfig = Number.parseInt(String(config?.debugPort || ""), 10);
-  if (Number.isFinite(fromConfig) && fromConfig > 0) return fromConfig;
-  return 9222;
+function readScreenConfigJson(configPath) {
+  if (!pathExists(configPath)) return null;
+  try {
+    const raw = fs.readFileSync(configPath, "utf8");
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveDebugPortFromConfigPath(configPath) {
+  const parsed = readScreenConfigJson(configPath);
+  const fromConfig = parsePositiveInteger(parsed?.debugPort);
+  if (fromConfig) return fromConfig;
+  return null;
 }
 
 function resolveWorkspaceDebugPort(workspaceRoot) {
+  const fromEnv = parsePositiveInteger(process.env.BOSS_RECRUIT_CHROME_PORT);
+  if (fromEnv) return fromEnv;
+
   const configPath = resolveScreenConfigPath(workspaceRoot);
-  if (pathExists(configPath)) {
-    const loaded = loadScreenConfig(configPath);
-    if (loaded.ok) {
-      return resolveDebugPort(loaded.config);
-    }
-  }
-  return resolveDebugPort(null);
+  const fromConfig = resolveDebugPortFromConfigPath(configPath);
+  if (fromConfig) return fromConfig;
+
+  return 9222;
 }
 
 export function runPipelinePreflight(workspaceRoot) {
   const searchDir = resolveSearchCliDir(workspaceRoot);
   const screenDir = resolveScreenCliDir(workspaceRoot);
   const screenConfigPath = resolveScreenConfigPath(workspaceRoot);
-  const loaded = pathExists(screenConfigPath) ? loadScreenConfig(screenConfigPath) : null;
-  const debugPort = loaded?.ok ? resolveDebugPort(loaded.config) : resolveDebugPort(null);
-  const calibrationPath = loaded?.ok
-    ? (loaded.config.calibrationFile
-      ? path.resolve(path.dirname(screenConfigPath), loaded.config.calibrationFile)
-      : getUserCalibrationPath())
+  const rawConfig = readScreenConfigJson(screenConfigPath);
+  const debugPort = resolveWorkspaceDebugPort(workspaceRoot);
+  const calibrationPath = rawConfig?.calibrationFile
+    ? path.resolve(path.dirname(screenConfigPath), rawConfig.calibrationFile)
     : getUserCalibrationPath();
   const checks = [
     {
@@ -255,12 +268,21 @@ export function runPipelinePreflight(workspaceRoot) {
       key: "favorite_calibration",
       ok: pathExists(calibrationPath),
       path: calibrationPath,
-      message: "favorite-calibration.json 不存在，请先完成收藏按钮校准"
+      optional: true,
+      message: "favorite-calibration.json 不存在（可选，仅在旧页面回退点击时需要）"
     }
   ];
 
+  const requiredCheckKeys = new Set([
+    "search_cli_dir",
+    "search_cli_entry",
+    "screen_cli_dir",
+    "screen_cli_entry",
+    "screen_config"
+  ]);
+
   return {
-    ok: checks.every((item) => item.ok),
+    ok: checks.every((item) => !requiredCheckKeys.has(item.key) || item.ok),
     checks,
     debug_port: debugPort,
     calibration_path: calibrationPath
@@ -354,7 +376,7 @@ export async function runScreenCli({ workspaceRoot, screenParams }) {
   const calibration = loaded.config.calibrationFile
     ? path.resolve(configBaseDir, loaded.config.calibrationFile)
     : getUserCalibrationPath();
-  const debugPort = resolveDebugPort(loaded.config);
+  const debugPort = resolveWorkspaceDebugPort(workspaceRoot);
 
   const outputName = `筛选结果_${Date.now()}.csv`;
   let outputPath = outputName;

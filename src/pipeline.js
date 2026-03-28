@@ -13,6 +13,9 @@ function buildRequiredConfirmations(parsedResult) {
   if (parsedResult.needs_recent_viewed_filter_confirmation) {
     confirmations.push("filter_recent_viewed");
   }
+  if (parsedResult.needs_criteria_confirmation) {
+    confirmations.push("criteria");
+  }
   if (parsedResult.has_unresolved_missing_fields) {
     confirmations.push("missing_fields_or_defaults");
   }
@@ -128,6 +131,13 @@ function classifyScreenFailure(screenResult) {
     };
   }
 
+  if (/DOM收藏不可用且缺少可用校准文件/i.test(stderr)) {
+    return {
+      code: "CALIBRATION_REQUIRED",
+      message: "当前页面无法通过DOM按钮完成收藏，且缺少可用的收藏校准文件用于回退点击。请运行 boss-recruit-mcp calibrate 生成 favorite-calibration.json 后重试。"
+    };
+  }
+
   return {
     code: "SCREEN_CLI_FAILED",
     message: "筛选工具执行失败，请检查模型配置、Chrome 远程调试和页面状态。"
@@ -155,20 +165,16 @@ export async function runRecruitPipeline({
     parsed.needs_keyword_confirmation
     || parsed.needs_search_params_confirmation
     || parsed.needs_recent_viewed_filter_confirmation
+    || parsed.needs_criteria_confirmation
   ) {
     return buildNeedConfirmationResponse(parsed);
   }
 
   const preflight = runPipelinePreflight(workspaceRoot);
   if (!preflight.ok) {
-    const missingCalibration = preflight.checks.find(
-      (check) => check.key === "favorite_calibration" && !check.ok
-    );
     return buildFailedResponse(
-      missingCalibration ? "CALIBRATION_REQUIRED" : "PIPELINE_PREFLIGHT_FAILED",
-      missingCalibration
-        ? `尚未完成收藏按钮校准。请先在当前环境打开 Boss 搜索页，打开任意候选人详情页，点击收藏，再点击取消收藏，然后关闭详情页；接着运行 boss-recruit-mcp calibrate --port ${preflight.debug_port} --output "${preflight.calibration_path}" 生成校准文件。不要复制其他目录或历史遗留的 favorite-calibration.json。`
-        : "招聘流水线运行前检查失败，请先修复缺失的本地依赖或配置文件。",
+      "PIPELINE_PREFLIGHT_FAILED",
+      "招聘流水线运行前检查失败，请先修复缺失的本地依赖或配置文件。",
       {
         search_params: parsed.searchParams,
         screen_params: parsed.screenParams,
@@ -198,6 +204,22 @@ export async function runRecruitPipeline({
           exit_code: searchResult.exit_code,
           error_code: searchResult.error_code,
           stderr: searchResult.stderr?.slice(0, 1200)
+        }
+      }
+    );
+  }
+
+  if (!Number.isInteger(searchResult.candidate_count)) {
+    return buildFailedResponse(
+      "SEARCH_RESULT_UNVERIFIED",
+      "搜索流程未能确认候选人数量，说明搜索步骤可能没有真正完成，已停止后续筛选。",
+      {
+        search_params: parsed.searchParams,
+        screen_params: parsed.screenParams,
+        diagnostics: {
+          candidate_count: searchResult.candidate_count,
+          stdout: searchResult.stdout?.slice(-1200),
+          stderr: searchResult.stderr?.slice(-1200)
         }
       }
     );

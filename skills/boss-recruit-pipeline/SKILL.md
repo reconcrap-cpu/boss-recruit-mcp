@@ -43,7 +43,11 @@ description: "Use when users ask to recruit candidates on Boss Zhipin via the bo
    - 若仍在 search 页面，可继续；
    - 若跳转到登录页、首页或其他 Boss 页面，视为“需要重新登录”；
    - 必须明确提示用户手动登录 Boss，并等待用户回复“已登录/可以继续”后，才能继续后续动作。
-8. 只有在以上条件满足后，才继续调用流水线。
+8. 无论是复用已有实例，还是新开实例并导航到 search 页面，只要曾经到达过 search，都必须再做一次短延时复查（例如 1-2 秒）：
+   - 若复查时仍在 search 页面，才允许继续；
+   - 若从 search 自动跳转到其他 Boss 页面，优先判定为“登录态失效/未登录”，提示用户先登录；
+   - 在用户明确回复“已登录，可以继续”前，不得执行搜索和筛选。
+9. 只有在以上条件满足后，才继续调用流水线。
 
 ## Calibration Requirement
 
@@ -140,8 +144,8 @@ description: "Use when users ask to recruit candidates on Boss Zhipin via the bo
    - MCP 是否可用
    - 若 MCP 不可用，CLI fallback 是否可用
    - Chrome 调试端口是否已确认
-   - Chrome 是否已启动到 Boss 搜索页面
-   - 如果刚启动了新的 Chrome 实例，是否仍停留在 Boss search 页面而未跳转登录
+   - Chrome 是否能被导航到 Boss 搜索页面
+   - 导航到 search 后 1-2 秒是否仍稳定停留在 search（而不是自动跳转）
    - `favorite-calibration.json` 是否存在
 2. 若缺少依赖或 MCP 未启动：
    - 自动安装依赖并帮助用户启动 MCP；
@@ -207,6 +211,8 @@ description: "Use when users ask to recruit candidates on Boss Zhipin via the bo
 12. 若返回 `FAILED`：
    - 先提炼 `error.code`、`error.message`、`diagnostics`；
    - 如果是 `PIPELINE_PREFLIGHT_FAILED`，明确指出缺失的本地目录 / 文件；
+   - 如果是 `BOSS_LOGIN_REQUIRED`，明确告诉用户“当前页面被跳转，疑似未登录/登录态失效”，并要求先登录再继续；
+   - 如果是 `BOSS_SEARCH_PAGE_NOT_READY`，明确告诉用户先修复 Chrome 调试连接和 search 页面导航问题；
    - 如果是 `CALIBRATION_REQUIRED`，明确提醒用户执行校准，并给出校准步骤；
    - 如果是 `SEARCH_PROCESS_PERMISSION_DENIED` 或 `SCREEN_PROCESS_PERMISSION_DENIED`，明确说明“当前环境拒绝创建子进程”，建议用户在本地终端直接运行 MCP；
    - 如果是 `SEARCH_CLI_MISSING` / `SCREEN_CLI_MISSING` / `SCREEN_CONFIG_ERROR`，直接告诉用户缺什么，不要只说“重试”；

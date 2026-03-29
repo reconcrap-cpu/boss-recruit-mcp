@@ -1,5 +1,10 @@
 import { parseRecruitInstruction } from "./parser.js";
-import { runPipelinePreflight, runSearchCli, runScreenCli } from "./adapters.js";
+import {
+  ensureBossSearchPageReady,
+  runPipelinePreflight,
+  runSearchCli,
+  runScreenCli
+} from "./adapters.js";
 
 function buildRequiredConfirmations(parsedResult) {
   const confirmations = [];
@@ -182,6 +187,42 @@ export async function runRecruitPipeline({
           checks: preflight.checks,
           debug_port: preflight.debug_port,
           calibration_path: preflight.calibration_path
+        }
+      }
+    );
+  }
+
+  const pageCheck = await ensureBossSearchPageReady(workspaceRoot, {
+    port: preflight.debug_port
+  });
+  if (!pageCheck.ok) {
+    if (
+      pageCheck.state === "LOGIN_REQUIRED"
+      || pageCheck.state === "LOGIN_REQUIRED_AFTER_REDIRECT"
+    ) {
+      return buildFailedResponse(
+        "BOSS_LOGIN_REQUIRED",
+        "Boss 页面未稳定停留在 search 页面，疑似未登录或登录态失效。请先在当前 Chrome 窗口手动登录 Boss，登录完成后再继续搜索和筛选。",
+        {
+          search_params: parsed.searchParams,
+          screen_params: parsed.screenParams,
+          diagnostics: {
+            debug_port: pageCheck.debug_port,
+            page_state: pageCheck.page_state
+          }
+        }
+      );
+    }
+
+    return buildFailedResponse(
+      "BOSS_SEARCH_PAGE_NOT_READY",
+      "无法确认 Boss search 页面已就绪。请先确保 Chrome 调试端口可连，并且页面能稳定停留在 https://www.zhipin.com/web/chat/search。",
+      {
+        search_params: parsed.searchParams,
+        screen_params: parsed.screenParams,
+        diagnostics: {
+          debug_port: pageCheck.debug_port,
+          page_state: pageCheck.page_state
         }
       }
     );

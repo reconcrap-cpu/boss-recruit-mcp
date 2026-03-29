@@ -5,6 +5,8 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 const currentFilePath = fileURLToPath(import.meta.url);
 const packagedMcpDir = path.resolve(path.dirname(currentFilePath), "..");
+const bossSearchUrl = "https://www.zhipin.com/web/chat/search";
+const chromeOnboardingUrlPattern = /^chrome:\/\/(welcome|intro|newtab|signin|history-sync|settings\/syncSetup)/i;
 
 function getCodexHome() {
   return process.env.CODEX_HOME
@@ -291,6 +293,239 @@ export function runPipelinePreflight(workspaceRoot) {
 
 function localDirHint(workspaceRoot, dirName) {
   return path.join(workspaceRoot, dirName);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function listChromeTabs(port) {
+  const response = await fetch(`http://127.0.0.1:${port}/json/list`);
+  if (!response.ok) {
+    throw new Error(`DevTools endpoint returned ${response.status}`);
+  }
+  const data = await response.json();
+  return Array.isArray(data) ? data : [];
+}
+
+function buildBossPageState(payload) {
+  return {
+    key: "boss_page_state",
+    ...payload
+  };
+}
+
+function extractSampleUrls(tabs, limit = 5) {
+  return tabs
+    .map((tab) => tab?.url)
+    .filter(Boolean)
+    .slice(0, limit);
+}
+
+function findChromeOnboardingUrl(tabs) {
+  for (const tab of tabs) {
+    if (typeof tab?.url === "string" && chromeOnboardingUrlPattern.test(tab.url)) {
+      return tab.url;
+    }
+  }
+  return null;
+}
+
+async function inspectBossPageState(port, options = {}) {
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 6000;
+  const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : 1000;
+  const expectedUrl = options.expectedUrl || bossSearchUrl;
+  const deadline = Date.now() + timeoutMs;
+  let lastError = null;
+  let lastTabs = [];
+
+  while (Date.now() < deadline) {
+    try {
+      const tabs = await listChromeTabs(port);
+      lastTabs = tabs;
+
+      const exactSearchTab = tabs.find(
+        (tab) => typeof tab?.url === "string" && tab.url.includes("/web/chat/search")
+      );
+      if (exactSearchTab) {
+        return buildBossPageState({
+          ok: true,
+          state: "SEARCH_READY",
+          path: exactSearchTab.url,
+          current_url: exactSearchTab.url,
+          title: exactSearchTab.title || null,
+          requires_login: false,
+          message: "Boss 搜索页已打开，且当前仍停留在 search 页面。"
+        });
+      }
+
+      const bossTab = tabs.find(
+        (tab) => typeof tab?.url === "string" && tab.url.includes("zhipin.com")
+      );
+      if (bossTab) {
+        return buildBossPageState({
+          ok: false,
+          state: "LOGIN_REQUIRED",
+          path: bossTab.url,
+          current_url: bossTab.url,
+          title: bossTab.title || null,
+          requires_login: true,
+          expected_url: expectedUrl,
+          message: "Boss 页面没有停留在 search 页面，通常表示需要重新登录。请手动登录 Boss 后再继续。"
+        });
+      }
+    } catch (error) {
+      lastError = error;
+    }
+
+    await sleep(pollMs);
+  }
+
+  if (lastError) {
+    return buildBossPageState({
+      ok: false,
+      state: "DEBUG_PORT_UNREACHABLE",
+      path: `http://127.0.0.1:${port}`,
+      current_url: null,
+      title: null,
+      requires_login: false,
+      expected_url: expectedUrl,
+      message: `无法连接到 Chrome DevTools 端口 ${port}。请确认 Chrome 已以远程调试模式启动。`,
+      error: lastError.message
+    });
+  }
+
+  const onboardingUrl = findChromeOnboardingUrl(lastTabs);
+  if (onboardingUrl) {
+    return buildBossPageState({
+      ok: false,
+      state: "CHROME_ONBOARDING_INTERCEPTED",
+      path: onboardingUrl,
+      current_url: onboardingUrl,
+      title: null,
+      requires_login: false,
+      expected_url: expectedUrl,
+      message: "Chrome 当前停留在登录/引导页，尚未稳定到 Boss 搜索页。",
+      sample_urls: extractSampleUrls(lastTabs)
+    });
+  }
+
+  return buildBossPageState({
+    ok: false,
+    state: "BOSS_TAB_NOT_FOUND",
+    path: expectedUrl,
+    current_url: null,
+    title: null,
+    requires_login: false,
+    expected_url: expectedUrl,
+    message: "未检测到 Boss 页面标签页。请确认 Chrome 已打开 Boss 搜索页。",
+    sample_urls: extractSampleUrls(lastTabs)
+  });
+}
+
+async function openBossSearchTab(port) {
+  const endpoint = `http://127.0.0.1:${port}/json/new?${encodeURIComponent(bossSearchUrl)}`;
+  const attempts = ["PUT", "GET"];
+  let lastError = null;
+
+  for (const method of attempts) {
+    try {
+      const response = await fetch(endpoint, { method });
+      if (response.ok) {
+        return { ok: true, method };
+      }
+      lastError = new Error(`DevTools /json/new returned ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  return {
+    ok: false,
+    error: lastError?.message || "Failed to open Boss search tab via DevTools /json/new"
+  };
+}
+
+async function verifySearchPageStable(port, options = {}) {
+  const settleMs = Number.isFinite(options.settleMs) ? options.settleMs : 1500;
+  const recheckTimeoutMs = Number.isFinite(options.recheckTimeoutMs) ? options.recheckTimeoutMs : 2500;
+  const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : 600;
+
+  await sleep(settleMs);
+  const recheck = await inspectBossPageState(port, { timeoutMs: recheckTimeoutMs, pollMs });
+  if (recheck.state === "SEARCH_READY") {
+    return recheck;
+  }
+  if (recheck.state === "LOGIN_REQUIRED") {
+    return buildBossPageState({
+      ...recheck,
+      state: "LOGIN_REQUIRED_AFTER_REDIRECT",
+      message: "Boss 页面曾进入 search 但随后跳转到其他页面，通常表示登录态失效。请先手动登录后再继续搜索和筛选。"
+    });
+  }
+  return recheck;
+}
+
+export async function ensureBossSearchPageReady(workspaceRoot, options = {}) {
+  const debugPort = Number.isFinite(options.port)
+    ? options.port
+    : resolveWorkspaceDebugPort(workspaceRoot);
+  const attempts = Number.isFinite(options.attempts) ? Math.max(1, options.attempts) : 3;
+  const inspectTimeoutMs = Number.isFinite(options.inspectTimeoutMs) ? options.inspectTimeoutMs : 6000;
+  const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : 800;
+  const settleMs = Number.isFinite(options.settleMs) ? options.settleMs : 800;
+
+  let pageState = await inspectBossPageState(debugPort, { timeoutMs: inspectTimeoutMs, pollMs });
+  if (pageState.state === "SEARCH_READY") {
+    const stableState = await verifySearchPageStable(debugPort, { settleMs, pollMs });
+    return {
+      ok: stableState.state === "SEARCH_READY",
+      debug_port: debugPort,
+      state: stableState.state,
+      page_state: stableState
+    };
+  }
+  if (pageState.state === "LOGIN_REQUIRED") {
+    return {
+      ok: false,
+      debug_port: debugPort,
+      state: pageState.state,
+      page_state: pageState
+    };
+  }
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    if (pageState.state === "DEBUG_PORT_UNREACHABLE") {
+      break;
+    }
+    await openBossSearchTab(debugPort);
+    await sleep(settleMs);
+    pageState = await inspectBossPageState(debugPort, { timeoutMs: inspectTimeoutMs, pollMs });
+    if (pageState.state === "SEARCH_READY") {
+      const stableState = await verifySearchPageStable(debugPort, { settleMs, pollMs });
+      return {
+        ok: stableState.state === "SEARCH_READY",
+        debug_port: debugPort,
+        state: stableState.state,
+        page_state: stableState
+      };
+    }
+    if (pageState.state === "LOGIN_REQUIRED") {
+      return {
+        ok: false,
+        debug_port: debugPort,
+        state: pageState.state,
+        page_state: pageState
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    debug_port: debugPort,
+    state: pageState.state || "UNKNOWN",
+    page_state: pageState
+  };
 }
 
 export async function runSearchCli({ workspaceRoot, searchParams }) {

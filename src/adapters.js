@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import CDP from "chrome-remote-interface";
 const currentFilePath = fileURLToPath(import.meta.url);
 const packagedMcpDir = path.resolve(path.dirname(currentFilePath), "..");
 const bossSearchUrl = "https://www.zhipin.com/web/chat/search";
@@ -159,6 +160,82 @@ function parseSearchCount(output) {
   const m = output.match(/找到\s*(\d+)\s*个候选人/);
   if (!m) return null;
   return Number.parseInt(m[1], 10);
+}
+
+async function detectSearchNoDataTip(debugPort) {
+  let client = null;
+  try {
+    const targets = await CDP.List({ port: debugPort });
+    const target = targets.find(
+      (item) => typeof item?.url === "string" && item.url.includes("/web/chat/search")
+    ) || targets.find((item) => item?.type === "page");
+    if (!target) {
+      return {
+        ok: false,
+        exhausted: null,
+        error: "No page target found on Chrome DevTools"
+      };
+    }
+
+    client = await CDP({
+      port: debugPort,
+      target
+    });
+    const { Runtime } = client;
+    await Runtime.enable();
+
+    const expression = `(function () {
+      try {
+        var rootDoc = document;
+        var iframe = document.querySelector("iframe");
+        if (iframe && iframe.contentWindow && iframe.contentWindow.document) {
+          rootDoc = iframe.contentWindow.document;
+        }
+        var tip = rootDoc.querySelector("i.tip-nodata");
+        return {
+          exhausted: Boolean(tip),
+          selector: "i.tip-nodata"
+        };
+      } catch (err) {
+        return {
+          exhausted: false,
+          selector: "i.tip-nodata",
+          error: String(err && err.message ? err.message : err)
+        };
+      }
+    })()`;
+    const evaluated = await Runtime.evaluate({
+      expression,
+      returnByValue: true,
+      awaitPromise: true
+    });
+    if (evaluated.exceptionDetails) {
+      return {
+        ok: false,
+        exhausted: null,
+        error: evaluated.exceptionDetails.exception?.description || "Runtime.evaluate failed"
+      };
+    }
+
+    const value = evaluated.result?.value || {};
+    return {
+      ok: true,
+      exhausted: value.exhausted === true,
+      details: value
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      exhausted: null,
+      error: error.message
+    };
+  } finally {
+    if (client) {
+      try {
+        await client.close();
+      } catch {}
+    }
+  }
 }
 
 function parseScreenSummary(output) {
@@ -569,11 +646,18 @@ export async function runSearchCli({ workspaceRoot, searchParams }) {
 
   const combined = `${result.stdout}\n${result.stderr}`;
   const candidateCount = parseSearchCount(combined);
+  const tipCheck = result.code === 0
+    ? await detectSearchNoDataTip(debugPort)
+    : { ok: false, exhausted: null, error: null };
 
   return {
     ok: result.code === 0,
     exit_code: result.code,
     candidate_count: candidateCount,
+    no_data_tip_present: tipCheck.ok ? tipCheck.exhausted : null,
+    no_data_tip_check: tipCheck.ok
+      ? { ok: true, details: tipCheck.details || null }
+      : { ok: false, error: tipCheck.error || null },
     stdout: result.stdout,
     stderr: result.stderr,
     error_code: result.error_code || null

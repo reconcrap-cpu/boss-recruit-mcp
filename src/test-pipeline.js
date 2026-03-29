@@ -53,6 +53,8 @@ function buildSearchOk(candidateCount) {
   return {
     ok: true,
     candidate_count: candidateCount,
+    no_data_tip_present: false,
+    no_data_tip_check: { ok: true, details: { exhausted: false } },
     stdout: "",
     stderr: "",
     error_code: null
@@ -177,6 +179,62 @@ async function testSearchExhaustedCompletesAndMergesCsv() {
   assert.ok(result.result.output_csv && fs.existsSync(result.result.output_csv));
   const mergedLines = readCsvLines(result.result.output_csv);
   assert.equal(mergedLines.length, 2);
+}
+
+async function testSearchExhaustedByTipNodataEvenWhenCandidateCountPositive() {
+  const tempDir = createTempDir("exhausted-tip");
+  const round1Csv = path.join(tempDir, "round-1.csv");
+  writeCsv(round1Csv, [
+    "赵六,浙大,电子信息,戊公司,工程师,理由D"
+  ]);
+
+  const parsed = createParsed({
+    screenParams: {
+      criteria: "候选人需有 AI infra 相关经历",
+      target_count: 100
+    }
+  });
+  const { deps, calls } = createDependencies({
+    parsed,
+    searchResults: [
+      buildSearchOk(120),
+      {
+        ...buildSearchOk(87),
+        no_data_tip_present: true,
+        no_data_tip_check: {
+          ok: true,
+          details: {
+            exhausted: true,
+            selector: "i.tip-nodata"
+          }
+        }
+      }
+    ],
+    screenResults: [
+      buildScreenOk({
+        processedCount: 80,
+        passedCount: 4,
+        outputCsv: round1Csv
+      })
+    ]
+  });
+
+  const result = await runRecruitPipeline(
+    {
+      workspaceRoot: tempDir,
+      instruction: "test",
+      confirmation: {},
+      overrides: {}
+    },
+    deps
+  );
+
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.result.completion_reason, "search_exhausted_no_candidates");
+  assert.equal(result.result.exhausted_by_tip_nodata, true);
+  assert.equal(result.result.processed_count, 80);
+  assert.equal(result.result.round_count, 2);
+  assert.equal(calls.searchParams[1].filter_recent_viewed, true);
 }
 
 async function testTargetReachedAcrossRoundsAndDuplicateRowsKept() {
@@ -364,6 +422,7 @@ async function testNeedInputGateStillWorks() {
 
 async function main() {
   await testSearchExhaustedCompletesAndMergesCsv();
+  await testSearchExhaustedByTipNodataEvenWhenCandidateCountPositive();
   await testTargetReachedAcrossRoundsAndDuplicateRowsKept();
   await testScreenNoProgressWithZeroProcessedExportsBeforeFail();
   await testScreenNoProgressWithInvalidProcessedAndNoCsv();

@@ -421,7 +421,8 @@ export async function runRecruitPipeline({
       );
     }
 
-    if (searchResult.candidate_count === 0) {
+    const exhaustedByTipNoData = searchResult.no_data_tip_present === true;
+    if (exhaustedByTipNoData || searchResult.candidate_count === 0) {
       const durationSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
       const mergedCsvPath = mergeRoundCsvFiles(roundOutputCsvPaths);
       return {
@@ -436,9 +437,12 @@ export async function runRecruitPipeline({
           output_csv: mergedCsvPath,
           round_count: roundCount,
           completion_reason: "search_exhausted_no_candidates",
+          exhausted_by_tip_nodata: exhaustedByTipNoData,
           target_count_semantics: "target_count means processed candidate count, not passed candidate count"
         },
-        message: "流水线已完成。累计处理人数未达到目标前，会自动重跑搜索和筛选；当新一轮搜索无可筛选人选时，按候选池耗尽结束。"
+        message: exhaustedByTipNoData
+          ? "流水线已完成。检测到页面出现 tip-nodata（i.tip-nodata），判定候选池已耗尽并结束。"
+          : "流水线已完成。累计处理人数未达到目标前，会自动重跑搜索和筛选；当新一轮搜索无可筛选人选时，按候选池耗尽结束。"
       };
     }
 

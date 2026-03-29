@@ -1,3 +1,8 @@
+---
+name: "boss-recruit-pipeline"
+description: "Use when users ask to recruit candidates on Boss Zhipin via the boss-recruit-mcp pipeline; enforce setup checks, calibration gating, parameter confirmation, and MCP/CLI fallback handling."
+---
+
 # Boss Recruit Pipeline Skill
 
 ## Purpose

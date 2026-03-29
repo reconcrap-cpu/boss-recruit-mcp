@@ -218,11 +218,13 @@ boss-recruit-mcp doctor --port <port>
 - 正式执行前应先单独做一轮参数确认，把已识别参数、待确认项、缺失项、默认值风险分开给用户确认
 - 若用户没提“是否过滤近14天查看”，会在 `pending_questions` 里返回该问题，调用方应先补问再继续
 - 用户未补齐缺失参数时，只有在明确同意默认值及其质量风险后，才允许继续
-- `target_count` 表示“目标处理人数”，不是“目标通过人数”；状态一旦是 `COMPLETED`，就表示本轮已完成，不应因通过人数不足而自动重跑
-- 确认后自动执行：搜索 CLI -> 点击搜索 -> 勾选“过滤近14天查看”（如启用） -> 筛选 CLI
+- `target_count` 表示“目标处理人数”，不是“目标通过人数”；会按“累计处理人数”自动多轮执行，直到达到目标处理人数，或新一轮搜索返回 0 个可筛选人选
+- 第 2 轮及后续轮次会强制 `filter_recent_viewed=true`（即过滤近 14 天查看过的人选），不受首轮开关影响
+- 确认后自动执行：搜索 CLI -> 点击搜索 -> 勾选“过滤近14天查看”（按轮次规则） -> 筛选 CLI
 - 返回摘要：目标数、已处理、通过数、耗时、输出 CSV
 - 执行前会先做本地依赖预检查，若目录 / 入口 / 配置文件缺失则返回 `PIPELINE_PREFLIGHT_FAILED`
 - 若缺少 `favorite-calibration.json`，会返回 `CALIBRATION_REQUIRED`
+- 若某轮搜索返回可筛选候选人但筛选 `processed_count` 非法或为 0，会先导出当前累计 CSV，再返回 `SCREEN_NO_PROGRESS`
 - 若当前运行环境不允许启动子进程，会返回更明确的权限错误码而不是笼统失败
 - 配置文件查找顺序：`BOSS_RECRUIT_SCREEN_CONFIG` > 工作区 `boss-recruit-mcp/config/screening-config.json` > 用户目录 `$CODEX_HOME/boss-recruit-mcp/screening-config.json` > 包内示例配置
 

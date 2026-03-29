@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { parseRecruitInstruction } from "./parser.js";
 import {
   ensureBossSearchPageReady,
@@ -69,6 +71,92 @@ function buildFailedResponse(code, message, extra = {}) {
       message,
       retryable: true
     },
+    ...extra
+  };
+}
+
+function normalizeCsvPath(csvPath) {
+  if (typeof csvPath !== "string") return null;
+  const trimmed = csvPath.trim();
+  if (!trimmed) return null;
+  return path.resolve(trimmed);
+}
+
+function isReadableFile(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return false;
+    const stat = fs.statSync(filePath);
+    return stat.isFile();
+  } catch {
+    return false;
+  }
+}
+
+function collectReadableCsvPaths(csvPaths) {
+  const unique = new Set();
+  for (const rawPath of csvPaths || []) {
+    const normalized = normalizeCsvPath(rawPath);
+    if (!normalized || unique.has(normalized)) continue;
+    if (isReadableFile(normalized)) {
+      unique.add(normalized);
+    }
+  }
+  return Array.from(unique);
+}
+
+function parseCsvContent(content) {
+  const normalized = String(content || "").replace(/^\uFEFF/, "");
+  const lines = normalized.split(/\r?\n/).filter((line) => line.trim() !== "");
+  if (lines.length === 0) return null;
+  return {
+    header: lines[0],
+    rows: lines.slice(1)
+  };
+}
+
+function mergeRoundCsvFiles(csvPaths) {
+  const readablePaths = collectReadableCsvPaths(csvPaths);
+  if (readablePaths.length === 0) return null;
+
+  let header = null;
+  const rows = [];
+
+  for (const csvPath of readablePaths) {
+    let content;
+    try {
+      content = fs.readFileSync(csvPath, "utf8");
+    } catch {
+      continue;
+    }
+    const parsed = parseCsvContent(content);
+    if (!parsed) continue;
+    if (!header) {
+      header = parsed.header;
+    }
+    rows.push(...parsed.rows);
+  }
+
+  if (!header) return null;
+
+  const outputDir = path.dirname(readablePaths[0]);
+  const outputPath = path.join(outputDir, `筛选结果_合并_${Date.now()}.csv`);
+  const mergedContent = `\uFEFF${header}\n${rows.join("\n")}${rows.length > 0 ? "\n" : ""}`;
+  fs.writeFileSync(outputPath, mergedContent, "utf8");
+  return outputPath;
+}
+
+function buildProgressDiagnostics({
+  preflight,
+  totalProcessedCount,
+  totalPassedCount,
+  roundCount,
+  extra = {}
+}) {
+  return {
+    debug_port: preflight.debug_port,
+    total_processed_count: totalProcessedCount,
+    total_passed_count: totalPassedCount,
+    round_count: roundCount,
     ...extra
   };
 }
@@ -149,14 +237,29 @@ function classifyScreenFailure(screenResult) {
   };
 }
 
+const defaultDependencies = {
+  parseRecruitInstruction,
+  ensureBossSearchPageReady,
+  runPipelinePreflight,
+  runSearchCli,
+  runScreenCli
+};
+
 export async function runRecruitPipeline({
   workspaceRoot,
   instruction,
   confirmation,
   overrides
-}) {
+}, dependencies = defaultDependencies) {
+  const {
+    parseRecruitInstruction: parseInstruction,
+    ensureBossSearchPageReady: ensureSearchPageReady,
+    runPipelinePreflight: runPreflight,
+    runSearchCli: searchCli,
+    runScreenCli: screenCli
+  } = dependencies;
   const startedAt = Date.now();
-  const parsed = parseRecruitInstruction({
+  const parsed = parseInstruction({
     instruction,
     confirmation,
     overrides
@@ -175,7 +278,7 @@ export async function runRecruitPipeline({
     return buildNeedConfirmationResponse(parsed);
   }
 
-  const preflight = runPipelinePreflight(workspaceRoot);
+  const preflight = runPreflight(workspaceRoot);
   if (!preflight.ok) {
     return buildFailedResponse(
       "PIPELINE_PREFLIGHT_FAILED",
@@ -192,127 +295,237 @@ export async function runRecruitPipeline({
     );
   }
 
-  const pageCheck = await ensureBossSearchPageReady(workspaceRoot, {
-    port: preflight.debug_port
-  });
-  if (!pageCheck.ok) {
-    if (
-      pageCheck.state === "LOGIN_REQUIRED"
-      || pageCheck.state === "LOGIN_REQUIRED_AFTER_REDIRECT"
-    ) {
-      return buildFailedResponse(
-        "BOSS_LOGIN_REQUIRED",
-        "Boss 页面未稳定停留在 search 页面，疑似未登录或登录态失效。请先在当前 Chrome 窗口手动登录 Boss，登录完成后再继续搜索和筛选。",
-        {
-          search_params: parsed.searchParams,
-          screen_params: parsed.screenParams,
-          diagnostics: {
-            debug_port: pageCheck.debug_port,
-            page_state: pageCheck.page_state
+  const initialTargetCount = parsed.screenParams.target_count;
+  if (!Number.isInteger(initialTargetCount) || initialTargetCount <= 0) {
+    return buildFailedResponse(
+      "INVALID_TARGET_COUNT",
+      "目标处理人数无效，请确认 target_count 为正整数后重试。",
+      {
+        search_params: parsed.searchParams,
+        screen_params: parsed.screenParams
+      }
+    );
+  }
+
+  let totalProcessedCount = 0;
+  let totalPassedCount = 0;
+  let roundCount = 0;
+  const roundOutputCsvPaths = [];
+
+  while (totalProcessedCount < initialTargetCount) {
+    roundCount += 1;
+
+    const remainingTargetCount = Math.max(0, initialTargetCount - totalProcessedCount);
+    const roundSearchParams = {
+      ...parsed.searchParams,
+      filter_recent_viewed: roundCount >= 2 ? true : parsed.searchParams.filter_recent_viewed
+    };
+    const roundScreenParams = {
+      ...parsed.screenParams,
+      target_count: remainingTargetCount
+    };
+
+    const pageCheck = await ensureSearchPageReady(workspaceRoot, {
+      port: preflight.debug_port
+    });
+    if (!pageCheck.ok) {
+      if (
+        pageCheck.state === "LOGIN_REQUIRED"
+        || pageCheck.state === "LOGIN_REQUIRED_AFTER_REDIRECT"
+      ) {
+        return buildFailedResponse(
+          "BOSS_LOGIN_REQUIRED",
+          "Boss 页面未稳定停留在 search 页面，疑似未登录或登录态失效。请先在当前 Chrome 窗口手动登录 Boss，登录完成后再继续搜索和筛选。",
+          {
+            search_params: roundSearchParams,
+            screen_params: roundScreenParams,
+            diagnostics: buildProgressDiagnostics({
+              preflight,
+              totalProcessedCount,
+              totalPassedCount,
+              roundCount,
+              extra: {
+                page_state: pageCheck.page_state
+              }
+            })
           }
+        );
+      }
+
+      return buildFailedResponse(
+        "BOSS_SEARCH_PAGE_NOT_READY",
+        "无法确认 Boss search 页面已就绪。请先确保 Chrome 调试端口可连，并且页面能稳定停留在 https://www.zhipin.com/web/chat/search。",
+        {
+          search_params: roundSearchParams,
+          screen_params: roundScreenParams,
+          diagnostics: buildProgressDiagnostics({
+            preflight,
+            totalProcessedCount,
+            totalPassedCount,
+            roundCount,
+            extra: {
+              page_state: pageCheck.page_state
+            }
+          })
         }
       );
     }
 
-    return buildFailedResponse(
-      "BOSS_SEARCH_PAGE_NOT_READY",
-      "无法确认 Boss search 页面已就绪。请先确保 Chrome 调试端口可连，并且页面能稳定停留在 https://www.zhipin.com/web/chat/search。",
-      {
-        search_params: parsed.searchParams,
-        screen_params: parsed.screenParams,
-        diagnostics: {
-          debug_port: pageCheck.debug_port,
-          page_state: pageCheck.page_state
-        }
-      }
-    );
-  }
-
-  const searchResult = await runSearchCli({
-    workspaceRoot,
-    searchParams: parsed.searchParams
-  });
-
-  if (!searchResult.ok) {
-    const failure = classifySearchFailure(searchResult);
-    return buildFailedResponse(
-      failure.code,
-      failure.message,
-      {
-        search_params: parsed.searchParams,
-        screen_params: parsed.screenParams,
-        diagnostics: {
-          exit_code: searchResult.exit_code,
-          error_code: searchResult.error_code,
-          stderr: searchResult.stderr?.slice(0, 1200)
-        }
-      }
-    );
-  }
-
-  if (!Number.isInteger(searchResult.candidate_count)) {
-    return buildFailedResponse(
-      "SEARCH_RESULT_UNVERIFIED",
-      "搜索流程未能确认候选人数量，说明搜索步骤可能没有真正完成，已停止后续筛选。",
-      {
-        search_params: parsed.searchParams,
-        screen_params: parsed.screenParams,
-        diagnostics: {
-          candidate_count: searchResult.candidate_count,
-          stdout: searchResult.stdout?.slice(-1200),
-          stderr: searchResult.stderr?.slice(-1200)
-        }
-      }
-    );
-  }
-
-  if (searchResult.candidate_count === 0) {
-    return buildFailedResponse(
-      "SEARCH_EMPTY_RESULT",
-      "搜索结果为空，已停止后续筛选。请调整搜索条件后重试。",
-      {
-        search_params: parsed.searchParams,
-        screen_params: parsed.screenParams,
-        diagnostics: {
-          candidate_count: 0
-        }
-      }
-    );
-  }
-
-  const screenResult = await runScreenCli({
-    workspaceRoot,
-    screenParams: parsed.screenParams
-  });
-
-  if (!screenResult.ok) {
-    const failure = classifyScreenFailure(screenResult);
-    return buildFailedResponse(failure.code, failure.message, {
-      search_params: parsed.searchParams,
-      screen_params: parsed.screenParams,
-      diagnostics: {
-        exit_code: screenResult.exit_code,
-        error_code: screenResult.error_code,
-        stderr: screenResult.stderr?.slice(0, 1200)
-      }
+    const searchResult = await searchCli({
+      workspaceRoot,
+      searchParams: roundSearchParams
     });
+
+    if (!searchResult.ok) {
+      const failure = classifySearchFailure(searchResult);
+      return buildFailedResponse(
+        failure.code,
+        failure.message,
+        {
+          search_params: roundSearchParams,
+          screen_params: roundScreenParams,
+          diagnostics: buildProgressDiagnostics({
+            preflight,
+            totalProcessedCount,
+            totalPassedCount,
+            roundCount,
+            extra: {
+              exit_code: searchResult.exit_code,
+              error_code: searchResult.error_code,
+              stderr: searchResult.stderr?.slice(0, 1200)
+            }
+          })
+        }
+      );
+    }
+
+    if (!Number.isInteger(searchResult.candidate_count)) {
+      return buildFailedResponse(
+        "SEARCH_RESULT_UNVERIFIED",
+        "搜索流程未能确认候选人数量，说明搜索步骤可能没有真正完成，已停止后续筛选。",
+        {
+          search_params: roundSearchParams,
+          screen_params: roundScreenParams,
+          diagnostics: buildProgressDiagnostics({
+            preflight,
+            totalProcessedCount,
+            totalPassedCount,
+            roundCount,
+            extra: {
+              candidate_count: searchResult.candidate_count,
+              stdout: searchResult.stdout?.slice(-1200),
+              stderr: searchResult.stderr?.slice(-1200)
+            }
+          })
+        }
+      );
+    }
+
+    if (searchResult.candidate_count === 0) {
+      const durationSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+      const mergedCsvPath = mergeRoundCsvFiles(roundOutputCsvPaths);
+      return {
+        status: "COMPLETED",
+        search_params: parsed.searchParams,
+        screen_params: parsed.screenParams,
+        result: {
+          target_count: initialTargetCount,
+          processed_count: totalProcessedCount,
+          passed_count: totalPassedCount,
+          duration_sec: durationSec,
+          output_csv: mergedCsvPath,
+          round_count: roundCount,
+          completion_reason: "search_exhausted_no_candidates",
+          target_count_semantics: "target_count means processed candidate count, not passed candidate count"
+        },
+        message: "流水线已完成。累计处理人数未达到目标前，会自动重跑搜索和筛选；当新一轮搜索无可筛选人选时，按候选池耗尽结束。"
+      };
+    }
+
+    const screenResult = await screenCli({
+      workspaceRoot,
+      screenParams: roundScreenParams
+    });
+
+    if (!screenResult.ok) {
+      const failure = classifyScreenFailure(screenResult);
+      return buildFailedResponse(failure.code, failure.message, {
+        search_params: roundSearchParams,
+        screen_params: roundScreenParams,
+        diagnostics: buildProgressDiagnostics({
+          preflight,
+          totalProcessedCount,
+          totalPassedCount,
+          roundCount,
+          extra: {
+            exit_code: screenResult.exit_code,
+            error_code: screenResult.error_code,
+            stderr: screenResult.stderr?.slice(0, 1200)
+          }
+        })
+      });
+    }
+
+    const summary = screenResult.summary || {};
+    const roundOutputCsvPath = normalizeCsvPath(summary.output_csv);
+    const roundProcessedCount = summary.processed_count;
+
+    if (!Number.isInteger(roundProcessedCount) || roundProcessedCount <= 0) {
+      const mergedCsvPath = mergeRoundCsvFiles([
+        ...roundOutputCsvPaths,
+        roundOutputCsvPath
+      ]);
+      return buildFailedResponse(
+        "SCREEN_NO_PROGRESS",
+        "本轮搜索返回了可筛选候选人，但筛选流程未产生有效处理进度。已先导出当前累计 CSV 结果，请检查页面状态或筛选工具日志后重试。",
+        {
+          search_params: roundSearchParams,
+          screen_params: roundScreenParams,
+          diagnostics: buildProgressDiagnostics({
+            preflight,
+            totalProcessedCount,
+            totalPassedCount,
+            roundCount,
+            extra: {
+              candidate_count: searchResult.candidate_count,
+              round_processed_count: roundProcessedCount ?? null,
+              round_passed_count: summary.passed_count ?? null,
+              round_output_csv: roundOutputCsvPath,
+              output_csv: mergedCsvPath
+            }
+          })
+        }
+      );
+    }
+
+    if (roundOutputCsvPath && isReadableFile(roundOutputCsvPath)) {
+      roundOutputCsvPaths.push(roundOutputCsvPath);
+    }
+
+    const roundPassedCount =
+      Number.isInteger(summary.passed_count) && summary.passed_count >= 0
+        ? summary.passed_count
+        : 0;
+    totalProcessedCount += roundProcessedCount;
+    totalPassedCount += roundPassedCount;
   }
 
   const durationSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
-  const summary = screenResult.summary || {};
+  const mergedCsvPath = mergeRoundCsvFiles(roundOutputCsvPaths);
   return {
     status: "COMPLETED",
     search_params: parsed.searchParams,
     screen_params: parsed.screenParams,
     result: {
-      target_count: summary.target_count ?? parsed.screenParams.target_count,
-      processed_count: summary.processed_count ?? null,
-      passed_count: summary.passed_count ?? null,
+      target_count: initialTargetCount,
+      processed_count: totalProcessedCount,
+      passed_count: totalPassedCount,
       duration_sec: durationSec,
-      output_csv: summary.output_csv,
+      output_csv: mergedCsvPath,
+      round_count: roundCount,
       completion_reason: "processed_target_reached",
       target_count_semantics: "target_count means processed candidate count, not passed candidate count"
     },
-    message: "流水线已完成。target_count 表示处理人数目标，而不是通过人数目标；即使通过人数小于 target_count，只要已处理达到目标人数，也应视为本轮完成。"
+    message: "流水线已完成。target_count 表示处理人数目标，而不是通过人数目标；当累计处理人数仍不足时会自动多轮执行，且从第2轮起会强制过滤近14天查看过的人选。"
   };
 }

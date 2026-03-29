@@ -20,6 +20,7 @@
     "install:local": "node src/cli.js install",
     "postinstall": "node scripts/postinstall.cjs",
     "test:parser": "node src/test-parser.js",
+    "test:pipeline": "node src/test-pipeline.js",
     "test:regression:win": "powershell -ExecutionPolicy Bypass -File scripts/regression.ps1 -Mode quick"
   },
   "files": [

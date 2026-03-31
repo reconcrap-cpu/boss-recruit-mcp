@@ -25,10 +25,12 @@ npx @reconcrap/boss-recruit-mcp install
 - 安装 Codex skill 到 `$CODEX_HOME/skills/boss-recruit-pipeline`
 - 初始化用户配置到 `$CODEX_HOME/boss-recruit-mcp/screening-config.json`
 - 生成通用 MCP 配置模板到 `$CODEX_HOME/boss-recruit-mcp/agent-mcp-configs`
+- 自动尝试写入已检测到的外部 agent MCP 配置（含 Trae / trae-cn / Cursor / Claude / OpenClaw）
+- 自动尝试把 skill 镜像到已检测到的外部 agent skills 目录
 - 包内自带 `boss-search-cli` 与 `boss-screen-cli` 运行时文件，无需额外目录结构
 - 不包含 `favorite-calibration.json`，首次使用前需要自行校准生成
 
-## 跨 Agent 快速接入（Cursor / Trae / Claude Code / OpenClaw）
+## 跨 Agent 快速接入（Cursor / Trae / trae-cn / Claude Code / OpenClaw）
 
 生成 MCP 配置模板：
 
@@ -58,6 +60,7 @@ $CODEX_HOME/boss-recruit-mcp/agent-mcp-configs
 boss-recruit-mcp mcp-config --client cursor
 boss-recruit-mcp mcp-config --client claudecode
 boss-recruit-mcp mcp-config --client trae
+boss-recruit-mcp mcp-config --client trae-cn
 boss-recruit-mcp mcp-config --client openclaw
 boss-recruit-mcp mcp-config --client generic
 ```
@@ -71,6 +74,13 @@ boss-recruit-mcp mcp-config --client generic
 
 ```bash
 boss-recruit-mcp mcp-config --client generic --command boss-recruit-mcp --args-json "[\"start\"]"
+```
+
+可选环境变量（用于跨 agent 自动配置）：
+
+```bash
+BOSS_RECRUIT_MCP_CONFIG_TARGETS   # JSON 数组或系统 path 分隔路径列表，指定额外 mcp.json 目标文件
+BOSS_RECRUIT_EXTERNAL_SKILL_DIRS  # JSON 数组或系统 path 分隔路径列表，指定额外 skills 根目录
 ```
 
 ## 准备配置

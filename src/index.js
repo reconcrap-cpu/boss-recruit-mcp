@@ -8,11 +8,18 @@ const require = createRequire(import.meta.url);
 const { version: SERVER_VERSION } = require("../package.json");
 const TOOL_NAME = "run_recruit_pipeline";
 const SERVER_NAME = "boss-recruit-mcp";
+const FRAMING_UNKNOWN = "unknown";
+const FRAMING_HEADER = "header";
+const FRAMING_LINE = "line";
 
-function writeMessage(message) {
+function writeMessage(message, framing = FRAMING_LINE) {
   const body = JSON.stringify(message);
-  const header = `Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n`;
-  process.stdout.write(header + body);
+  if (framing === FRAMING_HEADER) {
+    const header = `Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n`;
+    process.stdout.write(header + body);
+    return;
+  }
+  process.stdout.write(`${body}\n`);
 }
 
 function createJsonRpcError(id, code, message) {
@@ -178,42 +185,91 @@ export function startServer() {
   const mcpRoot = path.resolve(path.dirname(thisFile), "..");
   const workspaceRoot = envRoot ? path.resolve(envRoot) : path.resolve(mcpRoot, "..");
   let buffer = Buffer.alloc(0);
+  let framing = FRAMING_UNKNOWN;
 
   process.stdin.on("data", async (chunk) => {
     buffer = Buffer.concat([buffer, chunk]);
+    if (buffer.length >= 3 && buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) {
+      buffer = buffer.slice(3);
+    }
 
     while (true) {
-      const headerEnd = buffer.indexOf("\r\n\r\n");
-      if (headerEnd === -1) break;
+      const crlfHeaderEnd = buffer.indexOf("\r\n\r\n");
+      const lfHeaderEnd = buffer.indexOf("\n\n");
+      const crHeaderEnd = buffer.indexOf("\r\r");
+      let headerEnd = -1;
+      let headerSeparatorLength = 0;
+      if (
+        crlfHeaderEnd !== -1
+        && (lfHeaderEnd === -1 || crlfHeaderEnd < lfHeaderEnd)
+        && (crHeaderEnd === -1 || crlfHeaderEnd < crHeaderEnd)
+      ) {
+        headerEnd = crlfHeaderEnd;
+        headerSeparatorLength = 4;
+      } else if (lfHeaderEnd !== -1 && (crHeaderEnd === -1 || lfHeaderEnd < crHeaderEnd)) {
+        headerEnd = lfHeaderEnd;
+        headerSeparatorLength = 2;
+      } else if (crHeaderEnd !== -1) {
+        headerEnd = crHeaderEnd;
+        headerSeparatorLength = 2;
+      }
+      if (headerEnd !== -1) {
+        const headerText = buffer.slice(0, headerEnd).toString("utf8");
+        const contentLengthLine = headerText
+          .split(/\r\n|\n|\r/)
+          .find((line) => line.toLowerCase().startsWith("content-length:"));
 
-      const headerText = buffer.slice(0, headerEnd).toString("utf8");
-      const contentLengthLine = headerText
-        .split("\r\n")
-        .find((line) => line.toLowerCase().startsWith("content-length:"));
+        if (!contentLengthLine) {
+          buffer = buffer.slice(headerEnd + headerSeparatorLength);
+          continue;
+        }
 
-      if (!contentLengthLine) {
-        buffer = buffer.slice(headerEnd + 4);
+        const contentLength = Number.parseInt(contentLengthLine.split(":")[1].trim(), 10);
+        if (!Number.isFinite(contentLength) || contentLength < 0) {
+          buffer = buffer.slice(headerEnd + headerSeparatorLength);
+          continue;
+        }
+
+        const bodyStart = headerEnd + headerSeparatorLength;
+        const bodyEnd = bodyStart + contentLength;
+        if (buffer.length < bodyEnd) break;
+
+        const body = buffer.slice(bodyStart, bodyEnd).toString("utf8");
+        buffer = buffer.slice(bodyEnd);
+        framing = FRAMING_HEADER;
+
+        let message;
+        try {
+          message = JSON.parse(body);
+        } catch {
+          writeMessage(createJsonRpcError(null, -32700, "Parse error"), FRAMING_HEADER);
+          continue;
+        }
+
+        const response = await handleRequest(message, workspaceRoot);
+        if (response) writeMessage(response, framing);
         continue;
       }
 
-      const contentLength = Number.parseInt(contentLengthLine.split(":")[1].trim(), 10);
-      const bodyStart = headerEnd + 4;
-      const bodyEnd = bodyStart + contentLength;
-      if (buffer.length < bodyEnd) break;
-
-      const body = buffer.slice(bodyStart, bodyEnd).toString("utf8");
-      buffer = buffer.slice(bodyEnd);
+      const newlineIndex = buffer.indexOf("\n");
+      if (newlineIndex === -1) break;
+      const rawLine = buffer.slice(0, newlineIndex).toString("utf8").replace(/\r$/, "");
+      if (/^\s*content-length:/i.test(rawLine)) break;
+      buffer = buffer.slice(newlineIndex + 1);
+      const line = rawLine.trim();
+      if (!line) continue;
+      framing = FRAMING_LINE;
 
       let message;
       try {
-        message = JSON.parse(body);
+        message = JSON.parse(line);
       } catch {
-        writeMessage(createJsonRpcError(null, -32700, "Parse error"));
+        writeMessage(createJsonRpcError(null, -32700, "Parse error"), FRAMING_LINE);
         continue;
       }
 
       const response = await handleRequest(message, workspaceRoot);
-      if (response) writeMessage(response);
+      if (response) writeMessage(response, framing);
     }
   });
 }

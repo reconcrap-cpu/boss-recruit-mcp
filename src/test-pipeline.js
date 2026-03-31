@@ -420,6 +420,45 @@ async function testNeedInputGateStillWorks() {
   assert.equal(preflightCalled, false);
 }
 
+async function testPreflightRecoveryPlanOrder() {
+  const tempDir = createTempDir("preflight-recovery");
+  const parsed = createParsed();
+  const deps = {
+    parseRecruitInstruction: () => parsed,
+    runPipelinePreflight: () => ({
+      ok: false,
+      debug_port: 9222,
+      calibration_path: null,
+      checks: [
+        { key: "node_cli", ok: false },
+        { key: "npm_dep_ws", ok: false, install_cwd: "C:/workspace/boss-recruit-mcp" }
+      ]
+    }),
+    ensureBossSearchPageReady: async () => ({ ok: true, state: "SEARCH_READY", debug_port: 9222, page_state: {} }),
+    runSearchCli: async () => buildSearchOk(0),
+    runScreenCli: async () => buildScreenOk({ processedCount: 0, passedCount: 0, outputCsv: null })
+  };
+
+  const result = await runRecruitPipeline(
+    {
+      workspaceRoot: tempDir,
+      instruction: "test",
+      confirmation: {},
+      overrides: {}
+    },
+    deps
+  );
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.error.code, "PIPELINE_PREFLIGHT_FAILED");
+  assert.deepEqual(
+    result.diagnostics.recovery.ordered_steps.map((item) => item.id),
+    ["install_nodejs", "install_npm_dependencies"]
+  );
+  assert.deepEqual(result.diagnostics.recovery.ordered_steps[1].blocked_by, ["install_nodejs"]);
+  assert.equal(result.diagnostics.recovery.agent_prompt.includes("不要并行跳步"), true);
+}
+
 async function main() {
   await testSearchExhaustedCompletesAndMergesCsv();
   await testSearchExhaustedByTipNodataEvenWhenCandidateCountPositive();
@@ -427,6 +466,7 @@ async function main() {
   await testScreenNoProgressWithZeroProcessedExportsBeforeFail();
   await testScreenNoProgressWithInvalidProcessedAndNoCsv();
   await testNeedInputGateStillWorks();
+  await testPreflightRecoveryPlanOrder();
   // eslint-disable-next-line no-console
   console.log("pipeline tests passed");
 }

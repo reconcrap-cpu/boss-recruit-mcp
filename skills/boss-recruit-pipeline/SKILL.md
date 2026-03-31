@@ -289,6 +289,8 @@ description: "Use when users ask to recruit candidates on Boss Zhipin via the bo
 - 不要把底层 stderr 原样大段贴给用户，只提炼关键错误和下一步。
 - 如果失败原因明显是环境问题，要直接说明不是用户输入有误。
 - 如果工具已经返回 `diagnostics.checks`，优先基于这些检查项生成排障建议。
+- 如果返回 `PIPELINE_PREFLIGHT_FAILED` 且含 `diagnostics.recovery.agent_prompt`，优先把该提示词直接交给 AI agent 自动修复依赖。
+- 自动修复依赖必须严格串行：先 Node.js，再 npm 依赖；若涉及 Python / Pillow，先 Python 再 Pillow。
 - 如果工具返回 `output_csv`，在摘要里给出路径，避免重复解释内部流程。
 - 如果端口还没确认，必须先问用户“是否使用推荐的 `9222`，还是你已经有别的远程调试端口”，不能直接把 `9222` 当成已确认值。
 - 用户确认端口后，先执行一次 `boss-recruit-mcp set-port --port <port>`，让后续 `doctor / launch-chrome / calibrate / run` 自动复用同一端口。

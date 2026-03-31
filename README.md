@@ -234,6 +234,7 @@ boss-recruit-mcp doctor --port <port>
 - 确认后自动执行：搜索 CLI -> 点击搜索 -> 勾选“过滤近14天查看”（按轮次规则） -> 筛选 CLI
 - 返回摘要：目标数、已处理、通过数、耗时、输出 CSV
 - 执行前会先做本地依赖预检查，若目录 / 入口 / 配置文件缺失则返回 `PIPELINE_PREFLIGHT_FAILED`
+- preflight 会检查 Node.js 与 npm 依赖（`chrome-remote-interface` / `ws`）；失败时会返回 `diagnostics.recovery`（含有序修复步骤与 `agent_prompt`）
 - 若缺少 `favorite-calibration.json`，会返回 `CALIBRATION_REQUIRED`
 - 若某轮搜索返回可筛选候选人但筛选 `processed_count` 非法或为 0，会先导出当前累计 CSV，再返回 `SCREEN_NO_PROGRESS`
 - 若当前运行环境不允许启动子进程，会返回更明确的权限错误码而不是笼统失败

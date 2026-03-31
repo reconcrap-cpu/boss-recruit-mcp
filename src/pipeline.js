@@ -8,6 +8,126 @@ import {
   runScreenCli
 } from "./adapters.js";
 
+function dedupe(values = []) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function failedCheckSet(checks = []) {
+  const failed = checks
+    .filter((item) => item && item.ok === false && typeof item.key === "string")
+    .map((item) => item.key);
+  return new Set(failed);
+}
+
+function collectNpmInstallDirs(checks = [], workspaceRoot) {
+  const npmCheckKeys = new Set([
+    "npm_dep_chrome_remote_interface_search",
+    "npm_dep_chrome_remote_interface_screen",
+    "npm_dep_ws"
+  ]);
+  const dirs = checks
+    .filter((item) => item && item.ok === false && npmCheckKeys.has(item.key))
+    .map((item) => item.install_cwd)
+    .filter((value) => typeof value === "string" && value.trim());
+  if (dirs.length > 0) return dedupe(dirs);
+  return workspaceRoot ? [workspaceRoot] : [];
+}
+
+function buildNpmInstallCommands(checks = [], workspaceRoot) {
+  const dirs = collectNpmInstallDirs(checks, workspaceRoot);
+  const commands = [];
+  for (const dir of dirs) {
+    const escaped = String(dir).replace(/'/g, "''");
+    commands.push(`Set-Location '${escaped}'`);
+    commands.push("npm install");
+  }
+  return commands;
+}
+
+function formatCommandBlock(commands = []) {
+  return commands.map((command) => `- ${command}`).join("\n");
+}
+
+function buildPreflightRecovery(checks = [], workspaceRoot) {
+  const failed = failedCheckSet(checks);
+  if (failed.size === 0) return null;
+
+  const needNode = failed.has("node_cli");
+  const needNpm = (
+    failed.has("npm_dep_chrome_remote_interface_search")
+    || failed.has("npm_dep_chrome_remote_interface_screen")
+    || failed.has("npm_dep_ws")
+  );
+  const needPython = failed.has("python_cli");
+  const needPillow = failed.has("python_pillow");
+
+  const ordered_steps = [];
+  if (needNode) {
+    ordered_steps.push({
+      id: "install_nodejs",
+      title: "安装 Node.js >= 18",
+      blocked_by: [],
+      commands: [
+        "winget install OpenJS.NodeJS.LTS",
+        "node --version"
+      ]
+    });
+  }
+  if (needNpm) {
+    ordered_steps.push({
+      id: "install_npm_dependencies",
+      title: "安装 npm 依赖（chrome-remote-interface / ws）",
+      blocked_by: needNode ? ["install_nodejs"] : [],
+      commands: buildNpmInstallCommands(checks, workspaceRoot)
+    });
+  }
+  if (needPython) {
+    ordered_steps.push({
+      id: "install_python",
+      title: "安装 Python（确保 python 命令可用）",
+      blocked_by: [],
+      commands: [
+        "winget install Python.Python.3.12",
+        "python --version"
+      ]
+    });
+  }
+  if (needPillow) {
+    ordered_steps.push({
+      id: "install_pillow",
+      title: "安装 Pillow",
+      blocked_by: needPython ? ["install_python"] : [],
+      commands: [
+        "python -m pip install --upgrade pip",
+        "python -m pip install pillow"
+      ]
+    });
+  }
+
+  const promptLines = [
+    "你是环境修复 agent。请先读取 diagnostics.checks，再严格按下面顺序执行，不要并行跳步：",
+    "1) node_cli 失败 -> 先安装 Node.js，未成功前禁止执行 npm install。",
+    "2) npm_dep_* 失败 -> 再安装 npm 依赖（chrome-remote-interface / ws）。",
+    "3) python_cli 失败 -> 安装 Python 并确保 python 命令可用。",
+    "4) python_pillow 失败 -> 最后安装 Pillow。",
+    "每一步完成后都重新运行 doctor，直到所有检查通过后再重试 run_recruit_pipeline。"
+  ];
+
+  if (needNpm) {
+    const npmCommands = buildNpmInstallCommands(checks, workspaceRoot);
+    if (npmCommands.length > 0) {
+      promptLines.push("建议执行的 npm 命令：");
+      promptLines.push(formatCommandBlock(npmCommands));
+    }
+  }
+
+  return {
+    failed_check_keys: [...failed],
+    ordered_steps,
+    agent_prompt: promptLines.join("\n")
+  };
+}
+
 function buildRequiredConfirmations(parsedResult) {
   const confirmations = [];
 
@@ -280,6 +400,7 @@ export async function runRecruitPipeline({
 
   const preflight = runPreflight(workspaceRoot);
   if (!preflight.ok) {
+    const recovery = buildPreflightRecovery(preflight.checks, workspaceRoot);
     return buildFailedResponse(
       "PIPELINE_PREFLIGHT_FAILED",
       "招聘流水线运行前检查失败，请先修复缺失的本地依赖或配置文件。",
@@ -289,7 +410,8 @@ export async function runRecruitPipeline({
         diagnostics: {
           checks: preflight.checks,
           debug_port: preflight.debug_port,
-          calibration_path: preflight.calibration_path
+          calibration_path: preflight.calibration_path,
+          recovery
         }
       }
     );

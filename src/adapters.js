@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import CDP from "chrome-remote-interface";
 const currentFilePath = fileURLToPath(import.meta.url);
@@ -154,6 +154,117 @@ function runProcess({ command, args, cwd, timeoutMs }) {
       });
     });
   });
+}
+
+function runProcessSync({ command, args, cwd }) {
+  try {
+    const result = spawnSync(command, args, {
+      cwd,
+      windowsHide: true,
+      shell: false,
+      env: process.env,
+      encoding: "utf8"
+    });
+    const stdout = String(result.stdout || "").trim();
+    const stderr = String(result.stderr || "").trim();
+    return {
+      ok: result.status === 0,
+      status: result.status,
+      stdout,
+      stderr,
+      output: [stdout, stderr].filter(Boolean).join("\n").trim(),
+      error_code: result.error?.code || null,
+      error_message: result.error?.message || null
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: -1,
+      stdout: "",
+      stderr: "",
+      output: "",
+      error_code: error.code || "SPAWN_FAILED",
+      error_message: error.message || String(error)
+    };
+  }
+}
+
+function parseMajorVersion(raw) {
+  const match = String(raw || "").match(/v?(\d+)(?:\.\d+){0,2}/);
+  if (!match) return null;
+  const major = Number.parseInt(match[1], 10);
+  return Number.isFinite(major) ? major : null;
+}
+
+function buildNodeCommandCheck() {
+  const probe = runProcessSync({
+    command: "node",
+    args: ["--version"]
+  });
+  const major = parseMajorVersion(probe.output);
+  const versionOk = Number.isInteger(major) && major >= 18;
+  return {
+    key: "node_cli",
+    ok: probe.ok && versionOk,
+    path: "node --version",
+    message: probe.ok
+      ? (versionOk
+        ? `Node 命令可用 (${probe.output || "unknown version"})`
+        : `Node 版本过低 (${probe.output || "unknown version"})，要求 >= 18`)
+      : `未找到 node 命令，请先安装 Node.js >= 18。${probe.error_message ? ` (${probe.error_message})` : ""}`
+  };
+}
+
+function buildNodePackageCheck({ key, moduleName, cwd, missingMessage }) {
+  if (!cwd || !pathExists(cwd)) {
+    return {
+      key,
+      ok: false,
+      path: moduleName,
+      module: moduleName,
+      install_cwd: null,
+      message: missingMessage
+    };
+  }
+  const probe = runProcessSync({
+    command: "node",
+    args: ["-e", `require.resolve(${JSON.stringify(moduleName)});`],
+    cwd
+  });
+  return {
+    key,
+    ok: probe.ok,
+    path: moduleName,
+    module: moduleName,
+    install_cwd: cwd,
+    message: probe.ok
+      ? `${moduleName} npm 依赖可用`
+      : `缺少 npm 依赖 ${moduleName}，请在 boss-recruit-mcp 目录执行 npm install。`
+  };
+}
+
+function buildRuntimeDependencyChecks({ searchDir, screenDir }) {
+  return [
+    buildNodeCommandCheck(),
+    buildNodePackageCheck({
+      key: "npm_dep_chrome_remote_interface_search",
+      moduleName: "chrome-remote-interface",
+      cwd: searchDir,
+      missingMessage: "无法校验 chrome-remote-interface：boss-search-cli 目录不存在。"
+    }),
+    buildNodePackageCheck({
+      key: "npm_dep_chrome_remote_interface_screen",
+      moduleName: "chrome-remote-interface",
+      cwd: screenDir,
+      missingMessage: "无法校验 chrome-remote-interface：boss-screen-cli 目录不存在。"
+    }),
+    buildNodePackageCheck({
+      key: "npm_dep_ws",
+      moduleName: "ws",
+      cwd: screenDir,
+      missingMessage: "无法校验 ws：boss-screen-cli 目录不存在。"
+    })
+  ];
 }
 
 function parseSearchCount(output) {
@@ -351,13 +462,18 @@ export function runPipelinePreflight(workspaceRoot) {
       message: "favorite-calibration.json 不存在（可选，仅在旧页面回退点击时需要）"
     }
   ];
+  checks.push(...buildRuntimeDependencyChecks({ searchDir, screenDir }));
 
   const requiredCheckKeys = new Set([
     "search_cli_dir",
     "search_cli_entry",
     "screen_cli_dir",
     "screen_cli_entry",
-    "screen_config"
+    "screen_config",
+    "node_cli",
+    "npm_dep_chrome_remote_interface_search",
+    "npm_dep_chrome_remote_interface_screen",
+    "npm_dep_ws"
   ]);
 
   return {

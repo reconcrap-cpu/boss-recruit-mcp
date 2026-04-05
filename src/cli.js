@@ -136,10 +136,35 @@ function writeInstalledSkillVersion(version) {
 function getChromeUserDataDir(port, options = {}) {
   const rawProvided = options.userDataDir ?? options["user-data-dir"];
   const provided = typeof rawProvided === "string" ? rawProvided.trim() : "";
-  const basePath = provided || path.join(getCodexHome(), "boss-recruit-mcp", `chrome-profile-${port}`);
+  const basePath = provided || resolveDefaultChromeUserDataDir(port);
   const targetPath = path.resolve(basePath);
   ensureDir(targetPath);
   return targetPath;
+}
+
+function getSharedChromeUserDataDir(port) {
+  return path.join(getCodexHome(), "boss-mcp", `chrome-profile-${port}`);
+}
+
+function getLegacyRecruitChromeUserDataDir(port) {
+  return path.join(getCodexHome(), "boss-recruit-mcp", `chrome-profile-${port}`);
+}
+
+function getLegacyRecommendChromeUserDataDir(port) {
+  return path.join(os.homedir(), ".boss-recommend-mcp", `chrome-profile-${port}`);
+}
+
+function resolveDefaultChromeUserDataDir(port) {
+  const sharedPath = getSharedChromeUserDataDir(port);
+  if (pathExists(sharedPath)) {
+    return sharedPath;
+  }
+  const legacyPaths = [
+    getLegacyRecruitChromeUserDataDir(port),
+    getLegacyRecommendChromeUserDataDir(port)
+  ];
+  const legacyExisting = legacyPaths.find((candidate) => pathExists(candidate));
+  return legacyExisting || sharedPath;
 }
 
 function parseOptions(args) {

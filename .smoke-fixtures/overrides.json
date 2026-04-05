@@ -1,0 +1,11 @@
+﻿{
+    "city":  "杭州",
+    "degree":  "本科",
+    "schools":  [
+                    "985",
+                    "211"
+                ],
+    "keyword":  "核辐射",
+    "filter_recent_viewed":  false,
+    "target_count":  1000
+}

@@ -67,7 +67,25 @@ function buildScreenOk({ processedCount, passedCount = 0, outputCsv = null }) {
     summary: {
       processed_count: processedCount,
       passed_count: passedCount,
-      output_csv: outputCsv
+      output_csv: outputCsv,
+      checkpoint_path: outputCsv ? `${outputCsv}.checkpoint.json` : null
+    },
+    stdout: "",
+    stderr: "",
+    error_code: null
+  };
+}
+
+function buildScreenPaused({ processedCount, passedCount = 0, outputCsv = null, checkpointPath = null }) {
+  return {
+    ok: false,
+    paused: true,
+    summary: {
+      processed_count: processedCount,
+      passed_count: passedCount,
+      output_csv: outputCsv,
+      checkpoint_path: checkpointPath || (outputCsv ? `${outputCsv}.checkpoint.json` : null),
+      completion_reason: "paused"
     },
     stdout: "",
     stderr: "",
@@ -87,6 +105,7 @@ function createDependencies({
   const calls = {
     searchParams: [],
     screenParams: [],
+    screenResumes: [],
     pageChecks: 0,
     preflightChecks: 0
   };
@@ -123,8 +142,9 @@ function createDependencies({
         }
         return searchQueue.shift();
       },
-      runScreenCli: async ({ screenParams }) => {
+      runScreenCli: async ({ screenParams, resume }) => {
         calls.screenParams.push({ ...screenParams });
+        calls.screenResumes.push(resume ? { ...resume } : null);
         if (screenQueue.length === 0) {
           throw new Error("runScreenCli called more times than expected");
         }
@@ -299,8 +319,8 @@ async function testTargetReachedAcrossRoundsAndDuplicateRowsKept() {
   assert.equal(duplicateCount, 2);
 }
 
-async function testScreenNoProgressWithZeroProcessedExportsBeforeFail() {
-  const tempDir = createTempDir("no-progress-zero");
+async function testScreenNoProgressTriggersRecoveryAndCompletes() {
+  const tempDir = createTempDir("no-progress-recovery");
   const round1Csv = path.join(tempDir, "round-1.csv");
   const round2Csv = path.join(tempDir, "round-2.csv");
   writeCsv(round1Csv, [
@@ -318,7 +338,7 @@ async function testScreenNoProgressWithZeroProcessedExportsBeforeFail() {
   });
   const { deps } = createDependencies({
     parsed,
-    searchResults: [buildSearchOk(120), buildSearchOk(120)],
+    searchResults: [buildSearchOk(120), buildSearchOk(120), buildSearchOk(120)],
     screenResults: [
       buildScreenOk({
         processedCount: 80,
@@ -328,6 +348,11 @@ async function testScreenNoProgressWithZeroProcessedExportsBeforeFail() {
       buildScreenOk({
         processedCount: 0,
         passedCount: 0,
+        outputCsv: round2Csv
+      }),
+      buildScreenOk({
+        processedCount: 20,
+        passedCount: 1,
         outputCsv: round2Csv
       })
     ]
@@ -343,12 +368,12 @@ async function testScreenNoProgressWithZeroProcessedExportsBeforeFail() {
     deps
   );
 
-  assert.equal(result.status, "FAILED");
-  assert.equal(result.error.code, "SCREEN_NO_PROGRESS");
-  assert.equal(result.diagnostics.total_processed_count, 80);
-  assert.equal(result.diagnostics.round_count, 2);
-  assert.ok(result.diagnostics.output_csv && fs.existsSync(result.diagnostics.output_csv));
-  const mergedLines = readCsvLines(result.diagnostics.output_csv);
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.result.processed_count, 100);
+  assert.equal(result.result.passed_count, 10);
+  assert.equal(result.result.round_count, 2);
+  assert.ok(result.result.output_csv && fs.existsSync(result.result.output_csv));
+  const mergedLines = readCsvLines(result.result.output_csv);
   assert.equal(mergedLines.length, 3);
 }
 
@@ -385,7 +410,7 @@ async function testScreenNoProgressWithInvalidProcessedAndNoCsv() {
   assert.equal(result.status, "FAILED");
   assert.equal(result.error.code, "SCREEN_NO_PROGRESS");
   assert.equal(result.diagnostics.round_count, 1);
-  assert.equal(result.diagnostics.output_csv, null);
+  assert.equal(result.partial_result?.output_csv || result.diagnostics.output_csv || null, null);
 }
 
 async function testNeedInputGateStillWorks() {
@@ -459,14 +484,236 @@ async function testPreflightRecoveryPlanOrder() {
   assert.equal(result.diagnostics.recovery.agent_prompt.includes("不要并行跳步"), true);
 }
 
+async function testPauseBeforeScreenThenResumeRerunsSearch() {
+  const tempDir = createTempDir("pause-before-screen");
+  const roundCsv = path.join(tempDir, "round-pause-before-screen.csv");
+  writeCsv(roundCsv, [
+    "暂停后恢复候选人,复旦大学,软件工程,甲公司,算法工程师,理由A"
+  ]);
+  const parsed = createParsed({
+    screenParams: {
+      criteria: "候选人需有 AI infra 相关经历",
+      target_count: 20
+    }
+  });
+  const { deps, calls } = createDependencies({
+    parsed,
+    searchResults: [buildSearchOk(30), buildSearchOk(30)],
+    screenResults: [
+      buildScreenOk({
+        processedCount: 20,
+        passedCount: 3,
+        outputCsv: roundCsv
+      })
+    ]
+  });
+
+  let pauseRequested = false;
+  let latestContext = null;
+  const paused = await runRecruitPipeline(
+    {
+      workspaceRoot: tempDir,
+      instruction: "pause before screen",
+      confirmation: {},
+      overrides: {}
+    },
+    {
+      ...deps,
+      runSearchCli: async (input) => {
+        const result = await deps.runSearchCli(input);
+        pauseRequested = true;
+        return result;
+      }
+    },
+    {
+      isPauseRequested: () => pauseRequested,
+      onContext: (event) => {
+        latestContext = event.context;
+      }
+    }
+  );
+
+  assert.equal(paused.status, "PAUSED");
+  assert.equal(paused.partial_result.completion_reason, "paused_before_screen");
+  assert.equal(calls.searchParams.length, 1);
+  assert.equal(calls.screenParams.length, 0);
+
+  const resumed = await runRecruitPipeline(
+    {
+      workspaceRoot: tempDir,
+      instruction: "pause before screen",
+      confirmation: {},
+      overrides: {},
+      resume: {
+        resume: true,
+        previous_completion_reason: paused.partial_result.completion_reason
+      }
+    },
+    deps,
+    {
+      existingContext: latestContext,
+      isPauseRequested: () => false
+    }
+  );
+
+  assert.equal(resumed.status, "COMPLETED");
+  assert.equal(calls.searchParams.length, 2);
+  assert.equal(calls.screenParams.length, 1);
+}
+
+async function testScreenPauseResumeSkipsSearchAndUsesCheckpoint() {
+  const tempDir = createTempDir("pause-resume");
+  const roundCsv = path.join(tempDir, "round-pause.csv");
+  const checkpointPath = path.join(tempDir, "round-pause.checkpoint.json");
+  writeCsv(roundCsv, [
+    "暂停简历,浙大,计算机,乙公司,算法工程师,理由Pause"
+  ]);
+  fs.writeFileSync(checkpointPath, JSON.stringify({ ok: true }), "utf8");
+  const parsed = createParsed({
+    screenParams: {
+      criteria: "候选人需有 AI infra 相关经历",
+      target_count: 20
+    }
+  });
+  const { deps, calls } = createDependencies({
+    parsed,
+    searchResults: [buildSearchOk(30)],
+    screenResults: [
+      buildScreenPaused({
+        processedCount: 8,
+        passedCount: 2,
+        outputCsv: roundCsv,
+        checkpointPath
+      }),
+      buildScreenOk({
+        processedCount: 20,
+        passedCount: 4,
+        outputCsv: roundCsv
+      })
+    ]
+  });
+
+  let latestContext = null;
+  const paused = await runRecruitPipeline(
+    {
+      workspaceRoot: tempDir,
+      instruction: "pause in screen",
+      confirmation: {},
+      overrides: {}
+    },
+    deps,
+    {
+      onContext: (event) => {
+        latestContext = event.context;
+      }
+    }
+  );
+
+  assert.equal(paused.status, "PAUSED");
+  assert.equal(paused.partial_result.checkpoint_path, checkpointPath);
+  assert.equal(calls.searchParams.length, 1);
+  assert.equal(calls.screenParams.length, 1);
+
+  const resumed = await runRecruitPipeline(
+    {
+      workspaceRoot: tempDir,
+      instruction: "pause in screen",
+      confirmation: {},
+      overrides: {},
+      resume: {
+        resume: true,
+        checkpoint_path: checkpointPath,
+        output_csv: roundCsv,
+        previous_completion_reason: paused.partial_result.completion_reason
+      }
+    },
+    deps,
+    {
+      existingContext: latestContext
+    }
+  );
+
+  assert.equal(resumed.status, "COMPLETED");
+  assert.equal(calls.searchParams.length, 1);
+  assert.equal(calls.screenParams.length, 2);
+  assert.equal(calls.screenResumes[1].resume, true);
+  assert.equal(calls.screenResumes[1].require_checkpoint, true);
+}
+
+async function testCancelExportsPartialCsvBeforeStop() {
+  const tempDir = createTempDir("cancel-export");
+  const roundCsv = path.join(tempDir, "round-cancel.csv");
+  writeCsv(roundCsv, [
+    "取消前候选人,浙江大学,计算机,某公司,算法工程师,命中条件"
+  ]);
+  const parsed = createParsed({
+    screenParams: {
+      criteria: "候选人需有 AI infra 相关经历",
+      target_count: 20
+    }
+  });
+  const abortController = new AbortController();
+  const deps = {
+    parseRecruitInstruction: () => parsed,
+    runPipelinePreflight: () => ({
+      ok: true,
+      checks: [],
+      debug_port: 9222,
+      calibration_path: null
+    }),
+    ensureBossSearchPageReady: async () => ({
+      ok: true,
+      state: "SEARCH_READY",
+      debug_port: 9222,
+      page_state: {}
+    }),
+    runSearchCli: async () => buildSearchOk(50),
+    runScreenCli: async () => {
+      abortController.abort();
+      return {
+        ok: false,
+        exit_code: -1,
+        error_code: "ABORTED",
+        summary: {
+          processed_count: 6,
+          passed_count: 3,
+          output_csv: roundCsv
+        },
+        stdout: "",
+        stderr: "Process aborted by signal"
+      };
+    }
+  };
+
+  const result = await runRecruitPipeline(
+    {
+      workspaceRoot: tempDir,
+      instruction: "test cancel export",
+      confirmation: {},
+      overrides: {}
+    },
+    deps,
+    { signal: abortController.signal }
+  );
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.error.code, "PIPELINE_CANCELED");
+  assert.ok(result.partial_result.output_csv && fs.existsSync(result.partial_result.output_csv));
+  const mergedLines = readCsvLines(result.partial_result.output_csv);
+  assert.equal(mergedLines.length, 2);
+}
+
 async function main() {
   await testSearchExhaustedCompletesAndMergesCsv();
   await testSearchExhaustedByTipNodataEvenWhenCandidateCountPositive();
   await testTargetReachedAcrossRoundsAndDuplicateRowsKept();
-  await testScreenNoProgressWithZeroProcessedExportsBeforeFail();
+  await testScreenNoProgressTriggersRecoveryAndCompletes();
   await testScreenNoProgressWithInvalidProcessedAndNoCsv();
   await testNeedInputGateStillWorks();
   await testPreflightRecoveryPlanOrder();
+  await testPauseBeforeScreenThenResumeRerunsSearch();
+  await testScreenPauseResumeSkipsSearchAndUsesCheckpoint();
+  await testCancelExportsPartialCsvBeforeStop();
   // eslint-disable-next-line no-console
   console.log("pipeline tests passed");
 }

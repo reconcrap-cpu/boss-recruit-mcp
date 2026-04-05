@@ -81,9 +81,13 @@ let targetCount = Number.parseInt(args.target || args.targetCount || '', 10);
 if (!Number.isFinite(targetCount) || targetCount <= 0) {
     targetCount = null;
 }
+let roundIndex = parsePositiveInteger(args['round-index'] || args.roundIndex);
 let debugPort = resolveDebugPort({ explicitPort: args.port });
 let configFile = args.config ? path.resolve(String(args.config)) : path.resolve(process.cwd(), 'favorite-calibration.json');
 let outputCsv = args.output || `筛选结果_${Date.now()}.csv`;
+let checkpointPath = args['checkpoint-path'] ? path.resolve(String(args['checkpoint-path'])) : null;
+let pauseControlPath = args['pause-control-path'] ? path.resolve(String(args['pause-control-path'])) : null;
+const resumeRequested = args.resume === true;
 const bossSearchUrl = 'https://www.zhipin.com/web/chat/search';
 const calibrationScriptPath = path.join(__dirname, 'calibrate-favorite-position-v2.cjs');
 const MAX_RESUME_TEXT_CHARS = 12000;
@@ -100,11 +104,79 @@ if (args.help) {
 
 function printUsage() {
     const scriptName = path.basename(process.argv[1] || 'boss-screen-cli.cjs');
-    console.log(`Usage: node ${scriptName} --criteria <criteria> --targetCount <n> [--baseurl <url>] [--apikey <key>] [--model <model>] [--openai-organization <org_id>] [--openai-project <project_id>] [--port <number>] [--config <favorite-calibration.json>] [--output <csv>]`);
+    console.log(`Usage: node ${scriptName} --criteria <criteria> --targetCount <n> [--baseurl <url>] [--apikey <key>] [--model <model>] [--openai-organization <org_id>] [--openai-project <project_id>] [--port <number>] [--config <favorite-calibration.json>] [--output <csv>] [--checkpoint-path <json>] [--pause-control-path <json>] [--round-index <n>] [--resume]`);
     console.log(`  -p, --port <number>   Chrome调试端口（默认: ${debugPort}）`);
     console.log('  -h, --help            显示帮助');
     console.log('  端口优先级: --port > BOSS_RECRUIT_CHROME_PORT > screening-config.json.debugPort > 9222');
     console.log('Tip: run without parameters to enter step-by-step interactive mode.');
+}
+
+function normalizeText(value) {
+    return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function safeReadJson(filePath) {
+    try {
+        if (!filePath || !fs.existsSync(filePath)) return null;
+        return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    } catch {
+        return null;
+    }
+}
+
+function writeJsonAtomic(filePath, payload) {
+    if (!filePath) return;
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const tempPath = `${filePath}.tmp`;
+    fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+    fs.renameSync(tempPath, filePath);
+}
+
+function resolvePauseControl(controlFilePath) {
+    if (!controlFilePath) return { pause_requested: false, cancel_requested: false };
+    const parsed = safeReadJson(controlFilePath);
+    if (!parsed || typeof parsed !== 'object') {
+        return { pause_requested: false, cancel_requested: false };
+    }
+    const control = parsed.control && typeof parsed.control === 'object' ? parsed.control : parsed;
+    return {
+        pause_requested: control.pause_requested === true,
+        cancel_requested: control.cancel_requested === true
+    };
+}
+
+function buildStructuredSummary(state = {}) {
+    return {
+        round_index: roundIndex || null,
+        processed_count: Number.isInteger(state.processedCount) && state.processedCount >= 0 ? state.processedCount : 0,
+        passed_count: Array.isArray(state.passedCandidates) ? state.passedCandidates.length : 0,
+        output_csv: normalizeText(state.outputCsv || '') || null,
+        checkpoint_path: normalizeText(state.checkpointPath || '') || null,
+        completion_reason: normalizeText(state.completionReason || '') || null,
+        candidate_cursor: {
+            current_card_index: Number.isInteger(state.currentCardIndex) && state.currentCardIndex >= 0 ? state.currentCardIndex : 0,
+            processed_candidate_keys_count: Array.isArray(state.completedCandidateKeys)
+                ? state.completedCandidateKeys.length
+                : (state.processedCardKeys instanceof Set ? state.processedCardKeys.size : 0),
+            current_candidate_key: normalizeText(state.currentCandidateKey || '') || null
+        }
+    };
+}
+
+function emitStructuredResult(status, state = {}, error = null) {
+    const payload = {
+        status,
+        result: buildStructuredSummary(state)
+    };
+    if (error) {
+        payload.error = {
+            code: error.code || 'SCREEN_FAILED',
+            message: error.message || 'Unknown error',
+            recoverable: error.recoverable === true
+        };
+    }
+    console.log(JSON.stringify(payload));
+    return payload;
 }
 
 function parseKeyValueOutput(text) {
@@ -2307,15 +2379,154 @@ async function main() {
     let consecutiveCount = 0;
     let restThreshold = 30 + Math.floor(Math.random() * 11);
     let uncertainFavoriteCount = 0;
+    let lastVisibleCandidateKeys = [];
+    let currentCandidateKey = null;
+    const failureStreaks = {
+        detail_load: 0,
+        resume_extract: 0
+    };
+
+    function buildCheckpointPayload() {
+        const completedCandidateKeys = Array.from(processedCardKeys).filter((key) => key !== currentCandidateKey);
+        const stableProcessedCount = currentCandidateKey ? Math.max(processedCount - 1, 0) : processedCount;
+        return {
+            round_index: roundIndex || null,
+            criteria,
+            target_count: targetCount,
+            output_csv: outputCsv,
+            checkpoint_path: checkpointPath,
+            processed_count: stableProcessedCount,
+            passed_count: passedCandidates.length,
+            current_card_index: currentCardIndex,
+            completed_candidate_keys: completedCandidateKeys,
+            current_candidate_key: currentCandidateKey,
+            last_visible_candidate_keys: lastVisibleCandidateKeys,
+            uncertain_favorite_count: uncertainFavoriteCount,
+            consecutive_count: consecutiveCount,
+            rest_threshold: restThreshold,
+            failure_streaks: { ...failureStreaks },
+            passed_candidates: passedCandidates.map((candidate) => ({
+                name: candidate.name || '',
+                school: candidate.school || '',
+                major: candidate.major || '',
+                company: candidate.company || '',
+                position: candidate.position || '',
+                reason: candidate.reason || '',
+                summary: candidate.summary || ''
+            }))
+        };
+    }
+
+    function saveCheckpoint() {
+        if (!checkpointPath) return;
+        writeJsonAtomic(checkpointPath, buildCheckpointPayload());
+    }
+
+    function loadCheckpointIfNeeded() {
+        if (!resumeRequested || !checkpointPath || !fs.existsSync(checkpointPath)) return false;
+        const checkpoint = safeReadJson(checkpointPath);
+        if (!checkpoint || typeof checkpoint !== 'object') {
+            const error = new Error(`无法读取 checkpoint: ${checkpointPath}`);
+            error.code = 'RESUME_CHECKPOINT_INVALID';
+            error.recoverable = false;
+            throw error;
+        }
+        if (typeof checkpoint.output_csv === 'string' && checkpoint.output_csv.trim()) {
+            outputCsv = path.resolve(checkpoint.output_csv);
+        }
+        processedCount = Number.isInteger(checkpoint.processed_count) && checkpoint.processed_count >= 0
+            ? checkpoint.processed_count
+            : processedCount;
+        currentCardIndex = Number.isInteger(checkpoint.current_card_index) && checkpoint.current_card_index >= 0
+            ? checkpoint.current_card_index
+            : currentCardIndex;
+        uncertainFavoriteCount = Number.isInteger(checkpoint.uncertain_favorite_count) && checkpoint.uncertain_favorite_count >= 0
+            ? checkpoint.uncertain_favorite_count
+            : uncertainFavoriteCount;
+        consecutiveCount = Number.isInteger(checkpoint.consecutive_count) && checkpoint.consecutive_count >= 0
+            ? checkpoint.consecutive_count
+            : consecutiveCount;
+        restThreshold = Number.isInteger(checkpoint.rest_threshold) && checkpoint.rest_threshold > 0
+            ? checkpoint.rest_threshold
+            : restThreshold;
+        currentCandidateKey = normalizeText(checkpoint.current_candidate_key || '') || null;
+        lastVisibleCandidateKeys = Array.isArray(checkpoint.last_visible_candidate_keys)
+            ? checkpoint.last_visible_candidate_keys.filter(Boolean)
+            : [];
+        processedCardKeys.clear();
+        for (const key of Array.isArray(checkpoint.completed_candidate_keys) ? checkpoint.completed_candidate_keys.filter(Boolean) : []) {
+            processedCardKeys.add(key);
+        }
+        passedCandidates.splice(0, passedCandidates.length, ...(
+            Array.isArray(checkpoint.passed_candidates)
+                ? checkpoint.passed_candidates.map((candidate) => ({
+                    name: candidate?.name || '',
+                    school: candidate?.school || '',
+                    major: candidate?.major || '',
+                    company: candidate?.company || '',
+                    position: candidate?.position || '',
+                    reason: candidate?.reason || '',
+                    summary: candidate?.summary || ''
+                }))
+                : []
+        ));
+        if (checkpoint.failure_streaks && typeof checkpoint.failure_streaks === 'object') {
+            failureStreaks.detail_load = Number.isInteger(checkpoint.failure_streaks.detail_load) && checkpoint.failure_streaks.detail_load >= 0
+                ? checkpoint.failure_streaks.detail_load
+                : 0;
+            failureStreaks.resume_extract = Number.isInteger(checkpoint.failure_streaks.resume_extract) && checkpoint.failure_streaks.resume_extract >= 0
+                ? checkpoint.failure_streaks.resume_extract
+                : 0;
+        }
+        return true;
+    }
+
+    function shouldPauseAtBoundary() {
+        return resolvePauseControl(pauseControlPath).pause_requested === true;
+    }
+
+    function buildTerminalState(completionReason) {
+        return {
+            processedCount,
+            passedCandidates,
+            outputCsv,
+            checkpointPath,
+            currentCardIndex,
+            currentCandidateKey,
+            completedCandidateKeys: Array.from(processedCardKeys),
+            completionReason
+        };
+    }
+
+    function finalizeCandidateBoundary() {
+        currentCandidateKey = null;
+        saveCheckpoint();
+    }
 
     const checkAndHandleSave = setupSaveSignalHandler(passedCandidates, outputCsv);
+    const restoredFromCheckpoint = loadCheckpointIfNeeded();
+    if (restoredFromCheckpoint) {
+        console.log(`[恢复] 已从 checkpoint 恢复，已处理 ${processedCount} 位候选人。`);
+    }
 
     while (processedCount < targetCount) {
         console.log('');
         console.log('----------------------------------------');
         console.log(`处理进度: 已处理 ${processedCount}/${targetCount}（目标处理人数） 已通过 ${passedCandidates.length} 人 未确认收藏 ${uncertainFavoriteCount} 人`);
 
+        if (shouldPauseAtBoundary()) {
+            saveCheckpoint();
+            emitStructuredResult('PAUSED', buildTerminalState('paused'));
+            if (typeof checkAndHandleSave.cleanup === 'function') {
+                checkAndHandleSave.cleanup();
+            }
+            cdp.close();
+            return;
+        }
+        currentCandidateKey = null;
+
         const processedKeysArray = Array.from(processedCardKeys);
+        lastVisibleCandidateKeys = processedKeysArray;
         const findCardExpr = jsFindNextUnprocessedCard + '(' + currentCardIndex + ',' + JSON.stringify(processedKeysArray) + ')';
         const nextCardRaw = await cdp.send('Runtime.evaluate', { expression: findCardExpr, returnByValue: true });
         const nextCard = parseResult(nextCardRaw);
@@ -2383,6 +2594,7 @@ async function main() {
         processedCount++;
         const cardKey = nextCard.key || nextCard.jid || ('item_' + nextCard.index);
         processedCardKeys.add(cardKey);
+        currentCandidateKey = cardKey;
         currentCardIndex = nextCard.index + 1;
         console.log('');
         console.log(`>>> 点击第 ${nextCard.index + 1} 位人选 (key: ${cardKey})`);
@@ -2415,6 +2627,7 @@ async function main() {
                 const clickResult = parseResult(clickResultRaw);
                 if (!clickResult || !clickResult.success) {
                     console.log(`  JS点击也失败: ${clickResult ? clickResult.error : 'CDP timeout'}`);
+                    finalizeCandidateBoundary();
                     continue;
                 }
             }
@@ -2424,6 +2637,7 @@ async function main() {
             const clickResult = parseResult(clickResultRaw);
             if (!clickResult || !clickResult.success) {
                 console.log(`  点击失败: ${clickResult ? clickResult.error : 'CDP timeout'}`);
+                finalizeCandidateBoundary();
                 continue;
             }
         }
@@ -2443,8 +2657,11 @@ async function main() {
 
         if (!detailLoaded) {
             console.log('  详情页加载超时，跳过');
+            failureStreaks.detail_load += 1;
+            finalizeCandidateBoundary();
             continue;
         }
+        failureStreaks.detail_load = 0;
         console.log('  详情页已加载!');
 
         console.log('  等待简历API响应...');
@@ -2495,10 +2712,13 @@ async function main() {
 
         if (!candidateInfo || candidateInfo.error || !candidateInfo.resumeText) {
             console.log(`  获取简历信息失败`);
+            failureStreaks.resume_extract += 1;
             await closeResumePage(cdp);
             await sleep(humanDelay(800, 200));
+            finalizeCandidateBoundary();
             continue;
         }
+        failureStreaks.resume_extract = 0;
 
         console.log(`  姓名: ${candidateInfo.name || '未知'}`);
         console.log(`  学校: ${candidateInfo.school || '未知'}`);
@@ -2535,6 +2755,7 @@ async function main() {
                 console.log('  跳过此人选');
                 await closeResumePage(cdp);
                 await sleep(humanDelay(800, 200));
+                finalizeCandidateBoundary();
                 continue;
             }
 
@@ -2696,6 +2917,7 @@ async function main() {
 
         await closeResumePage(cdp);
         await sleep(humanDelay(800, 200));
+        finalizeCandidateBoundary();
 
         consecutiveCount++;
 
@@ -2764,6 +2986,11 @@ async function main() {
     console.log(`  完成条件: 已处理人数达到目标处理人数；不要求通过人数达到该值`);
     console.log('');
     console.log('Done.');
+    saveCheckpoint();
+    emitStructuredResult(
+        'COMPLETED',
+        buildTerminalState(processedCount >= targetCount ? 'processed_target_reached' : 'completed')
+    );
 }
 
 main().catch(e => {
@@ -2772,6 +2999,25 @@ main().catch(e => {
             process.stdin.setRawMode(false);
         } catch {}
     }
-    console.error('Fatal error:', e && e.message ? e.message : e);
+    const errorMessage = e && e.message ? e.message : String(e);
+    emitStructuredResult(
+        'FAILED',
+        {
+            processedCount: 0,
+            passedCandidates: [],
+            outputCsv,
+            checkpointPath,
+            currentCardIndex: 0,
+            currentCandidateKey: null,
+            completedCandidateKeys: [],
+            completionReason: 'failed'
+        },
+        {
+            code: e && e.code ? e.code : 'RECRUIT_SCREEN_FAILED',
+            message: errorMessage,
+            recoverable: e && e.recoverable === true
+        }
+    );
+    console.error('Fatal error:', errorMessage);
     process.exit(1);
 });

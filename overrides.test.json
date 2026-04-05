@@ -1,0 +1,8 @@
+{
+  "city": "杭州",
+  "degree": "本科",
+  "schools": ["985", "211", "双一流院校"],
+  "keyword": "AI infra",
+  "filter_recent_viewed": true,
+  "target_count": 1
+}

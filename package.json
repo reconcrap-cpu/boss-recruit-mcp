@@ -1,6 +1,6 @@
 {
   "name": "@reconcrap/boss-recruit-mcp",
-  "version": "1.0.18",
+  "version": "1.0.21",
   "description": "Unified MCP pipeline for boss-search-cli and boss-screen-cli",
   "keywords": [
     "boss",
@@ -21,6 +21,8 @@
     "postinstall": "node scripts/postinstall.cjs",
     "test:parser": "node src/test-parser.js",
     "test:pipeline": "node src/test-pipeline.js",
+    "test:run-state": "node src/test-run-state.js",
+    "test:async": "node src/test-index-async.js",
     "test:protocol:win": "powershell -ExecutionPolicy Bypass -File scripts/verify-multi-round-protocol.ps1 -Mode unit",
     "test:regression:win": "powershell -ExecutionPolicy Bypass -File scripts/regression.ps1 -Mode quick"
   },

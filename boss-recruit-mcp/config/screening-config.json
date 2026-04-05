@@ -1,0 +1,9 @@
+{
+  "baseUrl": "https://ark.cn-beijing.volces.com/api/v3",
+  "apiKey": "e4a97872-fe62-4126-a561-02d8ab27ebbf",
+  "model": "doubao-seed-1-6-lite-251015",
+  "openaiOrganization": "optional-org-id",
+  "openaiProject": "optional-project-id",
+  "outputDir": "C:\\Users\\yaolin\\Desktop",
+  "debugPort": 9222
+}

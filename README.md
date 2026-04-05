@@ -1,9 +1,13 @@
 # @reconcrap/boss-recruit-mcp
 
-统一招聘流水线 MCP（stdio）服务。将 `boss-search-cli` 与 `boss-screen-cli` 串联为单工具：
+统一招聘流水线 MCP（stdio）服务。将 `boss-search-cli` 与 `boss-screen-cli` 串联为统一流程：
 
-- 工具名：`run_recruit_pipeline`
-- 状态：`NEED_INPUT` / `NEED_CONFIRMATION` / `COMPLETED` / `FAILED`
+- `run_recruit_pipeline`（默认异步，但先执行与同步一致的前置门禁）
+- `start_recruit_pipeline_run`（异步启动，返回 `run_id`）
+- `get_recruit_pipeline_run`（查询运行状态快照）
+- `cancel_recruit_pipeline_run`（取消运行中任务）
+- 流程状态：`NEED_INPUT` / `NEED_CONFIRMATION` / `COMPLETED` / `FAILED`
+- run 状态：`queued` / `running` / `completed` / `failed` / `canceled`
 
 ## 通过 npm / npx 安装
 
@@ -120,6 +124,21 @@ boss-recruit-mcp start
 
 该服务通过 stdio 与 MCP client 通信。
 
+## 长流程 Agent 兼容模式
+
+当宿主 agent 对长时间阻塞调用敏感时，建议使用默认异步模式：
+
+1. 直接调用 `run_recruit_pipeline`（默认 async）。
+2. 工具会先执行与同步一致的前置门禁（参数确认、preflight、页面就绪）。
+3. 门禁未通过时，直接返回 `NEED_INPUT/NEED_CONFIRMATION/FAILED`，不会启动后台 run。
+4. 门禁通过后返回 `ACCEPTED + run_id`，随后轮询 `get_recruit_pipeline_run`。
+5. 若需要阻塞式返回，显式传 `execution_mode=sync`。
+
+说明：
+
+- 运行态文件保存在 `~/.boss-recruit-mcp/runs/<run_id>.json`（可通过 `BOSS_RECRUIT_HOME` 覆盖）。
+- 心跳默认 120 秒；阶段切换与进度更新会刷新 `updated_at`。
+
 ## CLI Fallback
 
 如果当前 AI agent 无法添加新的 MCP、MCP 数量受限，或者只支持 shell/命令执行，也可以直接调用同一后端的 CLI fallback：
@@ -207,11 +226,13 @@ boss-recruit-mcp doctor --port <port>
 
 ```json
 {
+  "execution_mode": "async",
   "instruction": "自然语言招聘指令",
   "confirmation": {
     "keyword_confirmed": true,
     "keyword_value": "ai infra",
     "search_params_confirmed": true,
+    "criteria_confirmed": true,
     "use_default_for_missing": false
   },
   "overrides": {

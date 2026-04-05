@@ -2,14 +2,22 @@ import fs from "node:fs";
 import path from "node:path";
 import { parseRecruitInstruction } from "./parser.js";
 import {
+  attemptPipelineAutoRepair,
   ensureBossSearchPageReady,
   runPipelinePreflight,
   runSearchCli,
   runScreenCli
 } from "./adapters.js";
 
+export const PIPELINE_STATUS_READY_TO_START_ASYNC = "READY_TO_START_ASYNC";
+const MAX_SCREEN_AUTO_RECOVERY_ATTEMPTS = 3;
+
 function dedupe(values = []) {
   return [...new Set(values.filter(Boolean))];
+}
+
+function normalizeText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
 }
 
 function failedCheckSet(checks = []) {
@@ -195,6 +203,121 @@ function buildFailedResponse(code, message, extra = {}) {
   };
 }
 
+function buildPausedResponse(message, extra = {}) {
+  return {
+    status: "PAUSED",
+    message: normalizeText(message || "") || "招聘流水线已暂停。",
+    ...extra
+  };
+}
+
+class PipelineAbortError extends Error {
+  constructor(message = "Pipeline execution aborted") {
+    super(message);
+    this.name = "PipelineAbortError";
+    this.code = "PIPELINE_ABORTED";
+  }
+}
+
+function isAbortSignalTriggered(signal) {
+  return Boolean(signal && signal.aborted);
+}
+
+function ensurePipelineNotAborted(signal) {
+  if (isAbortSignalTriggered(signal)) {
+    throw new PipelineAbortError("Pipeline execution aborted by caller.");
+  }
+}
+
+function safeInvokeRuntimeCallback(callback, payload) {
+  if (typeof callback !== "function") return;
+  try {
+    callback(payload);
+  } catch {
+    // Keep pipeline stable even if runtime callback fails.
+  }
+}
+
+function createPipelineRuntime(runtime = null) {
+  const signal = runtime?.signal;
+  const heartbeatIntervalMs = Number.isFinite(runtime?.heartbeatIntervalMs) && runtime.heartbeatIntervalMs > 0
+    ? runtime.heartbeatIntervalMs
+    : 10_000;
+  const precheckOnly = runtime?.precheckOnly === true;
+
+  function setStage(stage, message = null) {
+    safeInvokeRuntimeCallback(runtime?.onStage, {
+      stage,
+      message: normalizeText(message || "") || null,
+      at: new Date().toISOString()
+    });
+  }
+
+  function heartbeat(stage, details = null) {
+    safeInvokeRuntimeCallback(runtime?.onHeartbeat, {
+      stage,
+      details: details || null,
+      at: new Date().toISOString()
+    });
+  }
+
+  function output(stage, event) {
+    safeInvokeRuntimeCallback(runtime?.onOutput, {
+      stage,
+      ...(event || {}),
+      at: new Date().toISOString()
+    });
+  }
+
+  function progress(stage, payload) {
+    safeInvokeRuntimeCallback(runtime?.onProgress, {
+      stage,
+      ...(payload || {}),
+      at: new Date().toISOString()
+    });
+  }
+
+   function context(payload) {
+    safeInvokeRuntimeCallback(runtime?.onContext, {
+      context: payload && typeof payload === "object"
+        ? JSON.parse(JSON.stringify(payload))
+        : null,
+      at: new Date().toISOString()
+    });
+  }
+
+  function adapterRuntime(stage) {
+    return {
+      signal,
+      heartbeatIntervalMs,
+      onOutput: (event) => output(stage, event),
+      onHeartbeat: (event) => heartbeat(stage, event),
+      onProgress: (payload) => progress(stage, payload)
+    };
+  }
+
+  return {
+    signal,
+    heartbeatIntervalMs,
+    precheckOnly,
+    setStage,
+    heartbeat,
+    output,
+    progress,
+    context,
+    existingContext: runtime?.existingContext || null,
+    isPauseRequested: typeof runtime?.isPauseRequested === "function"
+      ? runtime.isPauseRequested
+      : () => false,
+    adapterRuntime
+  };
+}
+
+function isProcessAbortError(errorLike) {
+  const code = normalizeText(errorLike?.code || errorLike?.error_code || "").toUpperCase();
+  return code === "PROCESS_ABORTED" || code === "ABORTED";
+}
+
 function normalizeCsvPath(csvPath) {
   if (typeof csvPath !== "string") return null;
   const trimmed = csvPath.trim();
@@ -265,6 +388,140 @@ function mergeRoundCsvFiles(csvPaths) {
   return outputPath;
 }
 
+function cloneJson(value, fallback = null) {
+  try {
+    return value === undefined ? fallback : JSON.parse(JSON.stringify(value));
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeRoundState(round = {}) {
+  return {
+    round_index: Number.isInteger(round.round_index) && round.round_index > 0 ? round.round_index : null,
+    state: normalizeText(round.state || "") || null,
+    completion_reason: normalizeText(round.completion_reason || "") || null,
+    search_params: round.search_params && typeof round.search_params === "object" ? cloneJson(round.search_params, {}) : null,
+    candidate_count: Number.isInteger(round.candidate_count) && round.candidate_count >= 0 ? round.candidate_count : null,
+    search_completed: round.search_completed === true,
+    screen_output_csv: normalizeCsvPath(round.screen_output_csv),
+    checkpoint_path: normalizeText(round.checkpoint_path || "") || null,
+    auto_recovery_count: Number.isInteger(round.auto_recovery_count) && round.auto_recovery_count >= 0
+      ? round.auto_recovery_count
+      : 0,
+    screen_processed_count: Number.isInteger(round.screen_processed_count) && round.screen_processed_count >= 0
+      ? round.screen_processed_count
+      : null,
+    screen_passed_count: Number.isInteger(round.screen_passed_count) && round.screen_passed_count >= 0
+      ? round.screen_passed_count
+      : null
+  };
+}
+
+function createPipelineContext(workspaceRoot, instruction, confirmation, overrides, existingContext = null) {
+  const context = existingContext && typeof existingContext === "object"
+    ? cloneJson(existingContext, {})
+    : {};
+  const rounds = Array.isArray(context.rounds)
+    ? context.rounds.map((item) => normalizeRoundState(item)).filter(Boolean)
+    : [];
+  return {
+    ...context,
+    workspace_root: path.resolve(workspaceRoot),
+    instruction: String(instruction || ""),
+    confirmation: confirmation && typeof confirmation === "object" ? cloneJson(confirmation, {}) : {},
+    overrides: overrides && typeof overrides === "object" ? cloneJson(overrides, {}) : {},
+    rounds
+  };
+}
+
+function upsertRoundContext(context, roundIndex, patch = {}) {
+  if (!context || !Array.isArray(context.rounds)) return null;
+  const existingIndex = context.rounds.findIndex((item) => item?.round_index === roundIndex);
+  const existingRound = existingIndex >= 0 ? context.rounds[existingIndex] : {
+    round_index: roundIndex,
+    state: "queued",
+    completion_reason: null,
+    search_params: null,
+    candidate_count: null,
+    search_completed: false,
+    screen_output_csv: null,
+    checkpoint_path: null,
+    auto_recovery_count: 0,
+    screen_processed_count: null,
+    screen_passed_count: null
+  };
+  const nextRound = normalizeRoundState({
+    ...existingRound,
+    ...patch,
+    round_index: roundIndex
+  });
+  if (existingIndex >= 0) {
+    context.rounds[existingIndex] = nextRound;
+  } else {
+    context.rounds.push(nextRound);
+    context.rounds.sort((left, right) => (left.round_index || 0) - (right.round_index || 0));
+  }
+  return nextRound;
+}
+
+function getRoundContext(context, roundIndex) {
+  if (!context || !Array.isArray(context.rounds)) return null;
+  return context.rounds.find((item) => item?.round_index === roundIndex) || null;
+}
+
+function computeRoundDelta(context, roundIndex, roundProcessedCount = 0, roundPassedCount = 0) {
+  const existingRound = Number.isInteger(roundIndex) && roundIndex > 0
+    ? getRoundContext(context, roundIndex)
+    : null;
+  const previousProcessedCount = Number.isInteger(existingRound?.screen_processed_count)
+    ? existingRound.screen_processed_count
+    : 0;
+  const previousPassedCount = Number.isInteger(existingRound?.screen_passed_count)
+    ? existingRound.screen_passed_count
+    : 0;
+  return {
+    previousProcessedCount,
+    previousPassedCount,
+    processedDelta: Math.max(roundProcessedCount - previousProcessedCount, 0),
+    passedDelta: Math.max(roundPassedCount - previousPassedCount, 0)
+  };
+}
+
+function summarizeRounds(context) {
+  const rounds = Array.isArray(context?.rounds) ? context.rounds : [];
+  let processedCount = 0;
+  let passedCount = 0;
+  const outputCsvPaths = [];
+  for (const round of rounds) {
+    if (Number.isInteger(round?.screen_processed_count) && round.screen_processed_count > 0) {
+      processedCount += round.screen_processed_count;
+    }
+    if (Number.isInteger(round?.screen_passed_count) && round.screen_passed_count >= 0) {
+      passedCount += round.screen_passed_count;
+    }
+    const csvPath = normalizeCsvPath(round?.screen_output_csv);
+    if (csvPath && isReadableFile(csvPath)) {
+      outputCsvPaths.push(csvPath);
+    }
+  }
+  return {
+    processedCount,
+    passedCount,
+    roundCount: rounds.length,
+    outputCsvPaths: collectReadableCsvPaths(outputCsvPaths)
+  };
+}
+
+function getActiveResumeRound(context) {
+  const rounds = Array.isArray(context?.rounds) ? context.rounds : [];
+  if (rounds.length === 0) return null;
+  const lastRound = rounds[rounds.length - 1];
+  if (!lastRound || !Number.isInteger(lastRound.round_index) || lastRound.round_index <= 0) return null;
+  if (lastRound.state === "completed") return null;
+  return lastRound;
+}
+
 function buildProgressDiagnostics({
   preflight,
   totalProcessedCount,
@@ -313,51 +570,70 @@ function classifySearchFailure(searchResult) {
 }
 
 function classifyScreenFailure(screenResult) {
+  const structuredError = screenResult?.error && typeof screenResult.error === "object"
+    ? screenResult.error
+    : null;
+  const structuredCode = normalizeText(structuredError?.code || "").toUpperCase();
+  if (structuredCode) {
+    return {
+      code: structuredCode,
+      message: structuredError?.message || "筛选工具执行失败，请检查模型配置、Chrome 远程调试和页面状态。",
+      recoverable: structuredError?.recoverable === true
+    };
+  }
+
   const stderr = screenResult.stderr || "";
   const errorCode = screenResult.error_code || "";
 
   if (screenResult.config_error) {
     return {
       code: "SCREEN_CONFIG_ERROR",
-      message: "筛选工具配置缺失或格式错误，请检查 screening-config.json。"
+      message: "筛选工具配置缺失或格式错误，请检查 screening-config.json。",
+      recoverable: false
     };
   }
 
   if (errorCode === "EPERM" || /spawn EPERM/i.test(stderr)) {
     return {
       code: "SCREEN_PROCESS_PERMISSION_DENIED",
-      message: "筛选工具无法启动子进程，当前运行环境拒绝了进程创建权限。请在本地终端直接运行 MCP 或放宽运行权限后重试。"
+      message: "筛选工具无法启动子进程，当前运行环境拒绝了进程创建权限。请在本地终端直接运行 MCP 或放宽运行权限后重试。",
+      recoverable: false
     };
   }
 
   if (errorCode === "TIMEOUT" || /timed out/i.test(stderr)) {
     return {
       code: "SCREEN_TIMEOUT",
-      message: "筛选工具执行超时，可能是 Boss 页面交互卡住、LLM 接口响应过慢，或候选人列表处理速度异常。"
+      message: "筛选工具执行超时，可能是 Boss 页面交互卡住、LLM 接口响应过慢，或候选人列表处理速度异常。",
+      recoverable: true
     };
   }
 
   if (errorCode === "ENOENT" || /not recognized|Cannot find|MODULE_NOT_FOUND/i.test(stderr)) {
     return {
       code: "SCREEN_CLI_MISSING",
-      message: "筛选工具入口不存在或 Node 环境不可用，请检查 boss-screen-cli 安装与路径配置。"
+      message: "筛选工具入口不存在或 Node 环境不可用，请检查 boss-screen-cli 安装与路径配置。",
+      recoverable: false
     };
   }
 
   if (/DOM收藏不可用且缺少可用校准文件/i.test(stderr)) {
     return {
       code: "CALIBRATION_REQUIRED",
-      message: "当前页面无法通过DOM按钮完成收藏，且缺少可用的收藏校准文件用于回退点击。请运行 boss-recruit-mcp calibrate 生成 favorite-calibration.json 后重试。"
+      message: "当前页面无法通过DOM按钮完成收藏，且缺少可用的收藏校准文件用于回退点击。请运行 boss-recruit-mcp calibrate 生成 favorite-calibration.json 后重试。",
+      recoverable: false
     };
   }
 
   return {
     code: "SCREEN_CLI_FAILED",
-    message: "筛选工具执行失败，请检查模型配置、Chrome 远程调试和页面状态。"
+    message: "筛选工具执行失败，请检查模型配置、Chrome 远程调试和页面状态。",
+    recoverable: false
   };
 }
 
 const defaultDependencies = {
+  attemptPipelineAutoRepair,
   parseRecruitInstruction,
   ensureBossSearchPageReady,
   runPipelinePreflight,
@@ -365,19 +641,29 @@ const defaultDependencies = {
   runScreenCli
 };
 
-export async function runRecruitPipeline({
-  workspaceRoot,
-  instruction,
-  confirmation,
-  overrides
-}, dependencies = defaultDependencies) {
+export async function runRecruitPipeline(
+  {
+    workspaceRoot,
+    instruction,
+    confirmation,
+    overrides,
+    resume = null
+  },
+  dependencies = defaultDependencies,
+  runtime = null
+) {
+  const injectedDependencies = dependencies || {};
+  const resolvedDependencies = { ...defaultDependencies, ...(dependencies || {}) };
   const {
+    attemptPipelineAutoRepair: attemptAutoRepair,
     parseRecruitInstruction: parseInstruction,
     ensureBossSearchPageReady: ensureSearchPageReady,
     runPipelinePreflight: runPreflight,
     runSearchCli: searchCli,
     runScreenCli: screenCli
-  } = dependencies;
+  } = resolvedDependencies;
+  const runtimeHooks = createPipelineRuntime(runtime);
+  ensurePipelineNotAborted(runtimeHooks.signal);
   const startedAt = Date.now();
   const parsed = parseInstruction({
     instruction,
@@ -398,8 +684,41 @@ export async function runRecruitPipeline({
     return buildNeedConfirmationResponse(parsed);
   }
 
-  const preflight = runPreflight(workspaceRoot);
+  const pipelineContext = createPipelineContext(
+    workspaceRoot,
+    instruction,
+    confirmation,
+    overrides,
+    runtimeHooks.existingContext
+  );
+  const publishContext = () => runtimeHooks.context(pipelineContext);
+  const updateRound = (roundIndex, patch = {}) => {
+    const round = upsertRoundContext(pipelineContext, roundIndex, patch);
+    publishContext();
+    return round;
+  };
+  const currentRoundCount = () => Array.isArray(pipelineContext.rounds) ? pipelineContext.rounds.length : 0;
+  publishContext();
+
+  ensurePipelineNotAborted(runtimeHooks.signal);
+  runtimeHooks.setStage("preflight", "开始执行 preflight 检查。");
+  runtimeHooks.heartbeat("preflight");
+  let preflight = runPreflight(workspaceRoot);
+  let autoRepair = null;
+  const shouldAttemptAutoRepair = (
+    dependencies === defaultDependencies
+    || Object.prototype.hasOwnProperty.call(injectedDependencies, "attemptPipelineAutoRepair")
+  );
+  if (!preflight.ok && shouldAttemptAutoRepair && typeof attemptAutoRepair === "function") {
+    autoRepair = attemptAutoRepair(workspaceRoot, preflight);
+    if (autoRepair?.preflight) {
+      preflight = autoRepair.preflight;
+    }
+  }
   if (!preflight.ok) {
+    runtimeHooks.heartbeat("preflight", {
+      status: "failed"
+    });
     const recovery = buildPreflightRecovery(preflight.checks, workspaceRoot);
     return buildFailedResponse(
       "PIPELINE_PREFLIGHT_FAILED",
@@ -411,6 +730,7 @@ export async function runRecruitPipeline({
           checks: preflight.checks,
           debug_port: preflight.debug_port,
           calibration_path: preflight.calibration_path,
+          auto_repair: autoRepair,
           recovery
         }
       }
@@ -429,27 +749,268 @@ export async function runRecruitPipeline({
     );
   }
 
-  let totalProcessedCount = 0;
-  let totalPassedCount = 0;
-  let roundCount = 0;
-  const roundOutputCsvPaths = [];
+  ensurePipelineNotAborted(runtimeHooks.signal);
+  runtimeHooks.setStage("page_ready", "preflight 完成，开始检查 search 页面就绪状态。");
+  runtimeHooks.heartbeat("page_ready");
+  const initialPageCheck = await ensureSearchPageReady(workspaceRoot, {
+    port: preflight.debug_port
+  });
+  if (!initialPageCheck.ok) {
+    if (
+      initialPageCheck.state === "LOGIN_REQUIRED"
+      || initialPageCheck.state === "LOGIN_REQUIRED_AFTER_REDIRECT"
+    ) {
+      return buildFailedResponse(
+        "BOSS_LOGIN_REQUIRED",
+        "Boss 页面未稳定停留在 search 页面，疑似未登录或登录态失效。请先在当前 Chrome 窗口手动登录 Boss，登录完成后再继续搜索和筛选。",
+        {
+          search_params: parsed.searchParams,
+          screen_params: parsed.screenParams,
+          diagnostics: buildProgressDiagnostics({
+            preflight,
+            totalProcessedCount: 0,
+            totalPassedCount: 0,
+            roundCount: 0,
+            extra: {
+              page_state: initialPageCheck.page_state
+            }
+          })
+        }
+      );
+    }
+    return buildFailedResponse(
+      "BOSS_SEARCH_PAGE_NOT_READY",
+      "无法确认 Boss search 页面已就绪。请先确保 Chrome 调试端口可连，并且页面能稳定停留在 https://www.zhipin.com/web/chat/search。",
+      {
+        search_params: parsed.searchParams,
+        screen_params: parsed.screenParams,
+        diagnostics: buildProgressDiagnostics({
+          preflight,
+          totalProcessedCount: 0,
+          totalPassedCount: 0,
+          roundCount: 0,
+          extra: {
+            page_state: initialPageCheck.page_state
+          }
+        })
+      }
+    );
+  }
+
+  if (runtimeHooks.precheckOnly) {
+    return {
+      status: PIPELINE_STATUS_READY_TO_START_ASYNC,
+      search_params: parsed.searchParams,
+      screen_params: parsed.screenParams,
+      message: "前置门禁检查通过，可启动异步流水线。"
+    };
+  }
+
+  const restoredSummary = summarizeRounds(pipelineContext);
+  let totalProcessedCount = restoredSummary.processedCount;
+  let totalPassedCount = restoredSummary.passedCount;
+  let roundOutputCsvPaths = [...restoredSummary.outputCsvPaths];
+  let nextRoundIndex = restoredSummary.roundCount + 1;
+  let pendingResumeRound = resume?.resume === true ? getActiveResumeRound(pipelineContext) : null;
+  if (pendingResumeRound?.round_index) {
+    nextRoundIndex = pendingResumeRound.round_index;
+  }
+  const resumeCompletionReason = normalizeText(resume?.previous_completion_reason || "").toLowerCase();
+  const cancellationMessage = "流水线已取消，已导出取消前的累计结果。";
+
+  function buildCanceledResponse({
+    roundIndex = null,
+    roundSearchParams = parsed.searchParams,
+    roundScreenParams = parsed.screenParams,
+    outputCsv = null,
+    roundProcessedCount = 0,
+    roundPassedCount = 0,
+    checkpointPath = null,
+    completionReason = "canceled_by_user"
+  } = {}) {
+    const delta = computeRoundDelta(pipelineContext, roundIndex, roundProcessedCount, roundPassedCount);
+    const mergedCsvPath = mergeRoundCsvFiles([
+      ...roundOutputCsvPaths,
+      ...(outputCsv ? [outputCsv] : [])
+    ]);
+    const processedCount = totalProcessedCount + delta.processedDelta;
+    const passedCount = totalPassedCount + delta.passedDelta;
+    const durationSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+    runtimeHooks.setStage("finalize", "取消请求已生效，正在导出当前累计结果。");
+    runtimeHooks.heartbeat("finalize", {
+      status: "canceled"
+    });
+    runtimeHooks.progress("finalize", {
+      processed: processedCount,
+      passed: passedCount,
+      skipped: Math.max(processedCount - passedCount, 0),
+      greet_count: 0
+    });
+    if (Number.isInteger(roundIndex) && roundIndex > 0) {
+      updateRound(roundIndex, {
+        state: "canceled",
+        completion_reason: completionReason,
+        search_params: roundSearchParams,
+        search_completed: true,
+        screen_output_csv: outputCsv || null,
+        checkpoint_path: checkpointPath || null,
+        screen_processed_count: roundProcessedCount || null,
+        screen_passed_count: roundPassedCount || null
+      });
+    }
+    return buildFailedResponse(
+      "PIPELINE_CANCELED",
+      cancellationMessage,
+      {
+        search_params: roundSearchParams,
+        screen_params: roundScreenParams,
+        partial_result: {
+          target_count: initialTargetCount,
+          processed_count: processedCount,
+          passed_count: passedCount,
+          duration_sec: durationSec,
+          output_csv: mergedCsvPath,
+          round_count: currentRoundCount(),
+          current_round_index: roundIndex,
+          checkpoint_path: checkpointPath || null,
+          completion_reason: completionReason,
+          target_count_semantics: "target_count means processed candidate count, not passed candidate count"
+        },
+        diagnostics: buildProgressDiagnostics({
+          preflight,
+          totalProcessedCount: processedCount,
+          totalPassedCount: passedCount,
+          roundCount: currentRoundCount(),
+          extra: {
+            output_csv: mergedCsvPath,
+            checkpoint_path: checkpointPath || null,
+            completion_reason: completionReason
+          }
+        })
+      }
+    );
+  }
+
+  function buildPausedPartial({
+    message,
+    roundIndex = null,
+    roundSearchParams = parsed.searchParams,
+    roundScreenParams = parsed.screenParams,
+    outputCsv = null,
+    roundProcessedCount = 0,
+    roundPassedCount = 0,
+    checkpointPath = null,
+    completionReason = "paused"
+  } = {}) {
+    const delta = computeRoundDelta(pipelineContext, roundIndex, roundProcessedCount, roundPassedCount);
+    const mergedCsvPath = mergeRoundCsvFiles([
+      ...roundOutputCsvPaths,
+      ...(outputCsv ? [outputCsv] : [])
+    ]);
+    const processedCount = totalProcessedCount + delta.processedDelta;
+    const passedCount = totalPassedCount + delta.passedDelta;
+    if (Number.isInteger(roundIndex) && roundIndex > 0) {
+      updateRound(roundIndex, {
+        state: "paused",
+        completion_reason: completionReason,
+        search_params: roundSearchParams,
+        search_completed: true,
+        screen_output_csv: outputCsv || null,
+        checkpoint_path: checkpointPath || null,
+        screen_processed_count: roundProcessedCount || null,
+        screen_passed_count: roundPassedCount || null
+      });
+    }
+    return buildPausedResponse(message, {
+      search_params: roundSearchParams,
+      screen_params: roundScreenParams,
+      partial_result: {
+        target_count: initialTargetCount,
+        processed_count: processedCount,
+        passed_count: passedCount,
+        output_csv: mergedCsvPath,
+        round_count: currentRoundCount(),
+        current_round_index: roundIndex,
+        checkpoint_path: checkpointPath || null,
+        completion_reason: completionReason,
+        target_count_semantics: "target_count means processed candidate count, not passed candidate count"
+      },
+      diagnostics: buildProgressDiagnostics({
+        preflight,
+        totalProcessedCount: processedCount,
+        totalPassedCount: passedCount,
+        roundCount: currentRoundCount(),
+        extra: {
+          output_csv: mergedCsvPath,
+          checkpoint_path: checkpointPath || null,
+          completion_reason: completionReason
+        }
+      })
+    });
+  }
 
   while (totalProcessedCount < initialTargetCount) {
-    roundCount += 1;
+    if (runtimeHooks.isPauseRequested()) {
+      return buildPausedPartial({
+        message: "已在新一轮开始前暂停招聘流水线。",
+        completionReason: "paused_before_round_start"
+      });
+    }
 
+    if (isAbortSignalTriggered(runtimeHooks.signal)) {
+      return buildCanceledResponse({
+        completionReason: "canceled_before_round_start"
+      });
+    }
+
+    const roundIndex = pendingResumeRound?.round_index || nextRoundIndex;
     const remainingTargetCount = Math.max(0, initialTargetCount - totalProcessedCount);
+    const baseRoundSearchParams = pendingResumeRound?.search_params && typeof pendingResumeRound.search_params === "object"
+      ? pendingResumeRound.search_params
+      : parsed.searchParams;
     const roundSearchParams = {
       ...parsed.searchParams,
-      filter_recent_viewed: roundCount >= 2 ? true : parsed.searchParams.filter_recent_viewed
+      ...baseRoundSearchParams,
+      filter_recent_viewed: roundIndex >= 2
+        ? true
+        : baseRoundSearchParams.filter_recent_viewed ?? parsed.searchParams.filter_recent_viewed
     };
     const roundScreenParams = {
       ...parsed.screenParams,
       target_count: remainingTargetCount
     };
-
-    const pageCheck = await ensureSearchPageReady(workspaceRoot, {
-      port: preflight.debug_port
+    let roundState = updateRound(roundIndex, {
+      state: pendingResumeRound?.state || "queued",
+      completion_reason: pendingResumeRound?.completion_reason || null,
+      search_params: roundSearchParams,
+      search_completed: pendingResumeRound?.search_completed === true,
+      candidate_count: pendingResumeRound?.candidate_count ?? null,
+      checkpoint_path: pendingResumeRound?.checkpoint_path || null,
+      screen_output_csv: pendingResumeRound?.screen_output_csv || null,
+      auto_recovery_count: pendingResumeRound?.auto_recovery_count || 0,
+      screen_processed_count: pendingResumeRound?.screen_processed_count ?? null,
+      screen_passed_count: pendingResumeRound?.screen_passed_count ?? null
     });
+
+    if (roundIndex > 1 || pendingResumeRound) {
+      runtimeHooks.setStage("page_ready", `第 ${roundIndex} 轮：检查 search 页面就绪状态。`);
+      runtimeHooks.heartbeat("page_ready", {
+        round: roundIndex
+      });
+    }
+    const pageCheck = roundIndex === 1 && !pendingResumeRound
+      ? initialPageCheck
+      : await ensureSearchPageReady(workspaceRoot, {
+          port: preflight.debug_port
+        });
+    if (isAbortSignalTriggered(runtimeHooks.signal)) {
+      return buildCanceledResponse({
+        roundIndex,
+        roundSearchParams,
+        roundScreenParams,
+        completionReason: "canceled_during_page_ready"
+      });
+    }
     if (!pageCheck.ok) {
       if (
         pageCheck.state === "LOGIN_REQUIRED"
@@ -465,7 +1026,7 @@ export async function runRecruitPipeline({
               preflight,
               totalProcessedCount,
               totalPassedCount,
-              roundCount,
+              roundCount: currentRoundCount(),
               extra: {
                 page_state: pageCheck.page_state
               }
@@ -484,7 +1045,7 @@ export async function runRecruitPipeline({
             preflight,
             totalProcessedCount,
             totalPassedCount,
-            roundCount,
+            roundCount: currentRoundCount(),
             extra: {
               page_state: pageCheck.page_state
             }
@@ -493,58 +1054,126 @@ export async function runRecruitPipeline({
       );
     }
 
-    const searchResult = await searchCli({
-      workspaceRoot,
-      searchParams: roundSearchParams
-    });
-
-    if (!searchResult.ok) {
-      const failure = classifySearchFailure(searchResult);
-      return buildFailedResponse(
-        failure.code,
-        failure.message,
-        {
-          search_params: roundSearchParams,
-          screen_params: roundScreenParams,
-          diagnostics: buildProgressDiagnostics({
-            preflight,
-            totalProcessedCount,
-            totalPassedCount,
-            roundCount,
-            extra: {
-              exit_code: searchResult.exit_code,
-              error_code: searchResult.error_code,
-              stderr: searchResult.stderr?.slice(0, 1200)
-            }
-          })
-        }
-      );
+    const isResumeRun = resume?.resume === true;
+    const resumeFromPausedBeforeScreen = (
+      isResumeRun
+      && pendingResumeRound?.round_index === roundIndex
+      && resumeCompletionReason === "paused_before_screen"
+    );
+    let shouldRunSearch = true;
+    if (
+      pendingResumeRound?.round_index === roundIndex
+      && isResumeRun
+      && !resumeFromPausedBeforeScreen
+      && roundState.search_completed === true
+      && Boolean(normalizeText(roundState.checkpoint_path || ""))
+    ) {
+      shouldRunSearch = false;
     }
 
-    if (!Number.isInteger(searchResult.candidate_count)) {
-      return buildFailedResponse(
-        "SEARCH_RESULT_UNVERIFIED",
-        "搜索流程未能确认候选人数量，说明搜索步骤可能没有真正完成，已停止后续筛选。",
-        {
-          search_params: roundSearchParams,
-          screen_params: roundScreenParams,
-          diagnostics: buildProgressDiagnostics({
-            preflight,
-            totalProcessedCount,
-            totalPassedCount,
-            roundCount,
-            extra: {
-              candidate_count: searchResult.candidate_count,
-              stdout: searchResult.stdout?.slice(-1200),
-              stderr: searchResult.stderr?.slice(-1200)
-            }
-          })
-        }
-      );
+    let searchResult = null;
+    if (shouldRunSearch) {
+      ensurePipelineNotAborted(runtimeHooks.signal);
+      runtimeHooks.setStage("search", `第 ${roundIndex} 轮：开始执行 search。`);
+      runtimeHooks.heartbeat("search", {
+        round: roundIndex
+      });
+      searchResult = await searchCli({
+        workspaceRoot,
+        searchParams: roundSearchParams,
+        runtime: runtimeHooks.adapterRuntime("search")
+      });
+      if (isProcessAbortError(searchResult) || isAbortSignalTriggered(runtimeHooks.signal)) {
+        return buildCanceledResponse({
+          roundIndex,
+          roundSearchParams,
+          roundScreenParams,
+          completionReason: "canceled_during_search"
+        });
+      }
+
+      if (!searchResult.ok) {
+        const failure = classifySearchFailure(searchResult);
+        return buildFailedResponse(
+          failure.code,
+          failure.message,
+          {
+            search_params: roundSearchParams,
+            screen_params: roundScreenParams,
+            diagnostics: buildProgressDiagnostics({
+              preflight,
+              totalProcessedCount,
+              totalPassedCount,
+              roundCount: currentRoundCount(),
+              extra: {
+                exit_code: searchResult.exit_code,
+                error_code: searchResult.error_code,
+                stderr: searchResult.stderr?.slice(0, 1200)
+              }
+            })
+          }
+        );
+      }
+
+      if (!Number.isInteger(searchResult.candidate_count)) {
+        return buildFailedResponse(
+          "SEARCH_RESULT_UNVERIFIED",
+          "搜索流程未能确认候选人数量，说明搜索步骤可能没有真正完成，已停止后续筛选。",
+          {
+            search_params: roundSearchParams,
+            screen_params: roundScreenParams,
+            diagnostics: buildProgressDiagnostics({
+              preflight,
+              totalProcessedCount,
+              totalPassedCount,
+              roundCount: currentRoundCount(),
+              extra: {
+                candidate_count: searchResult.candidate_count,
+                stdout: searchResult.stdout?.slice(-1200),
+                stderr: searchResult.stderr?.slice(-1200)
+              }
+            })
+          }
+        );
+      }
+
+      roundState = updateRound(roundIndex, {
+        state: "search_completed",
+        completion_reason: null,
+        search_params: roundSearchParams,
+        candidate_count: searchResult.candidate_count,
+        search_completed: true
+      });
+    } else {
+      runtimeHooks.setStage("search", `第 ${roundIndex} 轮：复用暂停前的 search 结果，直接恢复 screen。`);
+      runtimeHooks.heartbeat("search", {
+        round: roundIndex,
+        resume: true,
+        reused_search: true
+      });
+      searchResult = {
+        ok: true,
+        candidate_count: roundState.candidate_count,
+        no_data_tip_present: false
+      };
     }
 
-    const exhaustedByTipNoData = searchResult.no_data_tip_present === true;
+    const exhaustedByTipNoData = searchResult?.no_data_tip_present === true;
     if (exhaustedByTipNoData || searchResult.candidate_count === 0) {
+      updateRound(roundIndex, {
+        state: "completed",
+        completion_reason: "search_exhausted_no_candidates",
+        search_completed: true,
+        candidate_count: searchResult?.candidate_count ?? null
+      });
+      runtimeHooks.setStage("finalize", "候选池已耗尽，正在汇总结果。");
+      runtimeHooks.heartbeat("finalize");
+      runtimeHooks.progress("finalize", {
+        processed: totalProcessedCount,
+        passed: totalPassedCount,
+        skipped: Math.max(totalProcessedCount - totalPassedCount, 0),
+        greet_count: 0
+      });
       const durationSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
       const mergedCsvPath = mergeRoundCsvFiles(roundOutputCsvPaths);
       return {
@@ -557,7 +1186,7 @@ export async function runRecruitPipeline({
           passed_count: totalPassedCount,
           duration_sec: durationSec,
           output_csv: mergedCsvPath,
-          round_count: roundCount,
+          round_count: currentRoundCount(),
           completion_reason: "search_exhausted_no_candidates",
           exhausted_by_tip_nodata: exhaustedByTipNoData,
           target_count_semantics: "target_count means processed candidate count, not passed candidate count"
@@ -568,76 +1197,318 @@ export async function runRecruitPipeline({
       };
     }
 
-    const screenResult = await screenCli({
-      workspaceRoot,
-      screenParams: roundScreenParams
-    });
-
-    if (!screenResult.ok) {
-      const failure = classifyScreenFailure(screenResult);
-      return buildFailedResponse(failure.code, failure.message, {
-        search_params: roundSearchParams,
-        screen_params: roundScreenParams,
-        diagnostics: buildProgressDiagnostics({
-          preflight,
-          totalProcessedCount,
-          totalPassedCount,
-          roundCount,
-          extra: {
-            exit_code: screenResult.exit_code,
-            error_code: screenResult.error_code,
-            stderr: screenResult.stderr?.slice(0, 1200)
-          }
-        })
+    if (runtimeHooks.isPauseRequested()) {
+      return buildPausedPartial({
+        message: "已在 screen 阶段开始前暂停招聘流水线。",
+        roundIndex,
+        roundSearchParams,
+        roundScreenParams,
+        outputCsv: normalizeCsvPath(roundState.screen_output_csv),
+        checkpointPath: normalizeText(roundState.checkpoint_path || "") || null,
+        completionReason: "paused_before_screen"
       });
     }
 
-    const summary = screenResult.summary || {};
-    const roundOutputCsvPath = normalizeCsvPath(summary.output_csv);
-    const roundProcessedCount = summary.processed_count;
+    let screenAutoRecoveryCount = Number.isInteger(roundState.auto_recovery_count)
+      ? roundState.auto_recovery_count
+      : 0;
+    let lastAutoRecovery = null;
+    let currentResumeConfig = {
+      checkpoint_path: normalizeText(
+        roundState.checkpoint_path
+        || resume?.checkpoint_path
+        || ""
+      ) || null,
+      pause_control_path: normalizeText(resume?.pause_control_path || "") || null,
+      output_csv: normalizeCsvPath(roundState.screen_output_csv || resume?.output_csv),
+      resume: Boolean(
+        pendingResumeRound
+        && isResumeRun
+        && (
+          normalizeText(roundState.checkpoint_path || "")
+          || normalizeText(roundState.screen_output_csv || "")
+        )
+      ),
+      require_checkpoint: Boolean(
+        pendingResumeRound
+        && isResumeRun
+        && normalizeText(roundState.checkpoint_path || "")
+        && !resumeFromPausedBeforeScreen
+      ),
+      round_index: roundIndex
+    };
 
-    if (!Number.isInteger(roundProcessedCount) || roundProcessedCount <= 0) {
-      const mergedCsvPath = mergeRoundCsvFiles([
-        ...roundOutputCsvPaths,
-        roundOutputCsvPath
-      ]);
-      return buildFailedResponse(
-        "SCREEN_NO_PROGRESS",
-        "本轮搜索返回了可筛选候选人，但筛选流程未产生有效处理进度。已先导出当前累计 CSV 结果，请检查页面状态或筛选工具日志后重试。",
-        {
-          search_params: roundSearchParams,
-          screen_params: roundScreenParams,
-          diagnostics: buildProgressDiagnostics({
-            preflight,
-            totalProcessedCount,
-            totalPassedCount,
-            roundCount,
-            extra: {
-              candidate_count: searchResult.candidate_count,
-              round_processed_count: roundProcessedCount ?? null,
-              round_passed_count: summary.passed_count ?? null,
-              round_output_csv: roundOutputCsvPath,
-              output_csv: mergedCsvPath
-            }
-          })
-        }
+    while (true) {
+      ensurePipelineNotAborted(runtimeHooks.signal);
+      runtimeHooks.setStage(
+        screenAutoRecoveryCount > 0 ? "screen_recovery" : "screen",
+        screenAutoRecoveryCount > 0
+          ? `第 ${roundIndex} 轮：screen 自动恢复第 ${screenAutoRecoveryCount} 次后继续执行。`
+          : `第 ${roundIndex} 轮：开始执行 screen。`
       );
-    }
-
-    if (roundOutputCsvPath && isReadableFile(roundOutputCsvPath)) {
-      roundOutputCsvPaths.push(roundOutputCsvPath);
-    }
-
-    const roundPassedCount =
-      Number.isInteger(summary.passed_count) && summary.passed_count >= 0
+      runtimeHooks.heartbeat(screenAutoRecoveryCount > 0 ? "screen_recovery" : "screen", {
+        round: roundIndex,
+        ...(lastAutoRecovery || {})
+      });
+      const screenResult = await screenCli({
+        workspaceRoot,
+        screenParams: roundScreenParams,
+        resume: currentResumeConfig,
+        runtime: runtimeHooks.adapterRuntime("screen")
+      });
+      const summary = screenResult.summary || {};
+      const roundOutputCsvPath = normalizeCsvPath(summary.output_csv || currentResumeConfig.output_csv);
+      const checkpointPath = normalizeText(summary.checkpoint_path || currentResumeConfig.checkpoint_path || "") || null;
+      const roundProcessedCount = Number.isInteger(summary.processed_count) ? summary.processed_count : 0;
+      const roundPassedCount = Number.isInteger(summary.passed_count) && summary.passed_count >= 0
         ? summary.passed_count
         : 0;
-    totalProcessedCount += roundProcessedCount;
-    totalPassedCount += roundPassedCount;
+      const delta = computeRoundDelta(pipelineContext, roundIndex, roundProcessedCount, roundPassedCount);
+
+      if (isProcessAbortError(screenResult) || isAbortSignalTriggered(runtimeHooks.signal)) {
+        return buildCanceledResponse({
+          roundIndex,
+          roundSearchParams,
+          roundScreenParams,
+          outputCsv: roundOutputCsvPath,
+          roundProcessedCount,
+          roundPassedCount,
+          checkpointPath,
+          completionReason: "canceled_during_screen"
+        });
+      }
+
+      if (screenResult.paused) {
+        return buildPausedPartial({
+          message: "招聘流水线已暂停，可使用 resume_recruit_pipeline_run 继续。",
+          roundIndex,
+          roundSearchParams,
+          roundScreenParams,
+          outputCsv: roundOutputCsvPath,
+          roundProcessedCount,
+          roundPassedCount,
+          checkpointPath,
+          completionReason: normalizeText(summary.completion_reason || "paused") || "paused"
+        });
+      }
+
+      const noProgress = !screenResult.ok
+        ? false
+        : !Number.isInteger(roundProcessedCount) || roundProcessedCount <= 0;
+      const hasRecoveryBasis = Boolean(checkpointPath || roundOutputCsvPath || delta.previousProcessedCount > 0);
+
+      if (!screenResult.ok || noProgress) {
+        const failure = noProgress
+          ? {
+              code: "SCREEN_NO_PROGRESS",
+              message: hasRecoveryBasis
+                ? "本轮筛选未产生新的有效进度，将尝试自动恢复。"
+                : "本轮搜索返回了可筛选候选人，但筛选流程未产生有效处理进度。",
+              recoverable: hasRecoveryBasis
+            }
+          : classifyScreenFailure(screenResult);
+        const recoverable = screenResult.error?.recoverable === true || failure.recoverable === true;
+        updateRound(roundIndex, {
+          state: recoverable ? "screen_recovery" : "failed",
+          completion_reason: failure.code.toLowerCase(),
+          search_params: roundSearchParams,
+          search_completed: true,
+          screen_output_csv: roundOutputCsvPath,
+          checkpoint_path: checkpointPath,
+          auto_recovery_count: screenAutoRecoveryCount,
+          screen_processed_count: roundProcessedCount || delta.previousProcessedCount || null,
+          screen_passed_count: roundPassedCount || delta.previousPassedCount || null
+        });
+
+        if (recoverable && screenAutoRecoveryCount < MAX_SCREEN_AUTO_RECOVERY_ATTEMPTS) {
+          screenAutoRecoveryCount += 1;
+          lastAutoRecovery = {
+            trigger: screenResult.error?.code || failure.code,
+            attempt: screenAutoRecoveryCount,
+            max_attempts: MAX_SCREEN_AUTO_RECOVERY_ATTEMPTS
+          };
+          updateRound(roundIndex, {
+            state: "screen_recovery",
+            auto_recovery_count: screenAutoRecoveryCount,
+            screen_output_csv: roundOutputCsvPath,
+            checkpoint_path: checkpointPath,
+            screen_processed_count: roundProcessedCount || delta.previousProcessedCount || null,
+            screen_passed_count: roundPassedCount || delta.previousPassedCount || null
+          });
+          runtimeHooks.setStage(
+            "screen_recovery",
+            `第 ${roundIndex} 轮 screen 可恢复失败，开始自动恢复（第 ${screenAutoRecoveryCount} 次）。`
+          );
+          runtimeHooks.heartbeat("screen_recovery", {
+            round: roundIndex,
+            ...lastAutoRecovery
+          });
+
+          const recoveryPageCheck = await ensureSearchPageReady(workspaceRoot, {
+            port: preflight.debug_port
+          });
+          if (!recoveryPageCheck.ok) {
+            return buildFailedResponse(
+              recoveryPageCheck.state === "LOGIN_REQUIRED" || recoveryPageCheck.state === "LOGIN_REQUIRED_AFTER_REDIRECT"
+                ? "BOSS_LOGIN_REQUIRED"
+                : "BOSS_SEARCH_PAGE_NOT_READY",
+              recoveryPageCheck.state === "LOGIN_REQUIRED" || recoveryPageCheck.state === "LOGIN_REQUIRED_AFTER_REDIRECT"
+                ? "自动恢复期间发现 Boss 登录态失效，请先重新登录后再继续。"
+                : "自动恢复期间未能重新确认 Boss search 页面就绪。",
+              {
+                search_params: roundSearchParams,
+                screen_params: roundScreenParams,
+                diagnostics: buildProgressDiagnostics({
+                  preflight,
+                  totalProcessedCount,
+                  totalPassedCount,
+                  roundCount: currentRoundCount(),
+                  extra: {
+                    page_state: recoveryPageCheck.page_state,
+                    auto_recovery: lastAutoRecovery
+                  }
+                })
+              }
+            );
+          }
+
+          const recoverySearch = await searchCli({
+            workspaceRoot,
+            searchParams: roundSearchParams,
+            runtime: runtimeHooks.adapterRuntime("search")
+          });
+          if (!recoverySearch.ok || !Number.isInteger(recoverySearch.candidate_count)) {
+            const recoveryFailure = classifySearchFailure(recoverySearch);
+            return buildFailedResponse(
+              recoveryFailure.code,
+              `自动恢复期间重跑 search 失败：${recoveryFailure.message}`,
+              {
+                search_params: roundSearchParams,
+                screen_params: roundScreenParams,
+                diagnostics: buildProgressDiagnostics({
+                  preflight,
+                  totalProcessedCount,
+                  totalPassedCount,
+                  roundCount: currentRoundCount(),
+                  extra: {
+                    auto_recovery: lastAutoRecovery,
+                    exit_code: recoverySearch.exit_code,
+                    error_code: recoverySearch.error_code,
+                    stderr: recoverySearch.stderr?.slice(-1200)
+                  }
+                })
+              }
+            );
+          }
+
+          roundState = updateRound(roundIndex, {
+            state: "search_completed",
+            search_params: roundSearchParams,
+            candidate_count: recoverySearch.candidate_count,
+            search_completed: true,
+            checkpoint_path: checkpointPath,
+            screen_output_csv: roundOutputCsvPath,
+            auto_recovery_count: screenAutoRecoveryCount,
+            screen_processed_count: roundProcessedCount || delta.previousProcessedCount || null,
+            screen_passed_count: roundPassedCount || delta.previousPassedCount || null
+          });
+          currentResumeConfig = {
+            checkpoint_path: checkpointPath,
+            pause_control_path: currentResumeConfig.pause_control_path,
+            output_csv: roundOutputCsvPath || currentResumeConfig.output_csv,
+            resume: true,
+            require_checkpoint: Boolean(checkpointPath),
+            round_index: roundIndex
+          };
+          continue;
+        }
+
+        const mergedCsvPath = mergeRoundCsvFiles([
+          ...roundOutputCsvPaths,
+          ...(roundOutputCsvPath ? [roundOutputCsvPath] : [])
+        ]);
+        return buildFailedResponse(
+          failure.code,
+          failure.message,
+          {
+            search_params: roundSearchParams,
+            screen_params: roundScreenParams,
+            partial_result: {
+              target_count: initialTargetCount,
+              processed_count: totalProcessedCount + delta.processedDelta,
+              passed_count: totalPassedCount + delta.passedDelta,
+              output_csv: mergedCsvPath,
+              round_count: currentRoundCount(),
+              current_round_index: roundIndex,
+              checkpoint_path: checkpointPath,
+              completion_reason: failure.code.toLowerCase(),
+              target_count_semantics: "target_count means processed candidate count, not passed candidate count"
+            },
+            diagnostics: buildProgressDiagnostics({
+              preflight,
+              totalProcessedCount,
+              totalPassedCount,
+              roundCount: currentRoundCount(),
+              extra: {
+                candidate_count: searchResult?.candidate_count ?? null,
+                round_processed_count: roundProcessedCount || null,
+                round_passed_count: roundPassedCount || null,
+                round_output_csv: roundOutputCsvPath,
+                checkpoint_path: checkpointPath,
+                auto_recovery: lastAutoRecovery,
+                exit_code: screenResult.exit_code,
+                error_code: screenResult.error_code,
+                stderr: screenResult.stderr?.slice(0, 1200)
+              }
+            })
+          }
+        );
+      }
+
+      if (roundOutputCsvPath && isReadableFile(roundOutputCsvPath)) {
+        roundOutputCsvPaths = collectReadableCsvPaths([
+          ...roundOutputCsvPaths,
+          roundOutputCsvPath
+        ]);
+      }
+
+      totalProcessedCount += delta.processedDelta;
+      totalPassedCount += delta.passedDelta;
+      roundState = updateRound(roundIndex, {
+        state: "completed",
+        completion_reason: "screen_completed",
+        search_params: roundSearchParams,
+        search_completed: true,
+        candidate_count: searchResult?.candidate_count ?? roundState.candidate_count ?? null,
+        screen_output_csv: roundOutputCsvPath,
+        checkpoint_path: checkpointPath,
+        auto_recovery_count: screenAutoRecoveryCount,
+        screen_processed_count: roundProcessedCount,
+        screen_passed_count: roundPassedCount
+      });
+      runtimeHooks.progress("screen", {
+        processed: totalProcessedCount,
+        passed: totalPassedCount,
+        skipped: Math.max(totalProcessedCount - totalPassedCount, 0),
+        greet_count: 0
+      });
+      break;
+    }
+
+    pendingResumeRound = null;
+    nextRoundIndex = roundIndex + 1;
   }
 
+  runtimeHooks.setStage("finalize", "筛选完成，正在汇总结果。");
+  runtimeHooks.heartbeat("finalize");
   const durationSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
   const mergedCsvPath = mergeRoundCsvFiles(roundOutputCsvPaths);
+  runtimeHooks.progress("finalize", {
+    processed: totalProcessedCount,
+    passed: totalPassedCount,
+    skipped: Math.max(totalProcessedCount - totalPassedCount, 0),
+    greet_count: 0
+  });
   return {
     status: "COMPLETED",
     search_params: parsed.searchParams,
@@ -648,7 +1519,7 @@ export async function runRecruitPipeline({
       passed_count: totalPassedCount,
       duration_sec: durationSec,
       output_csv: mergedCsvPath,
-      round_count: roundCount,
+      round_count: currentRoundCount(),
       completion_reason: "processed_target_reached",
       target_count_semantics: "target_count means processed candidate count, not passed candidate count"
     },

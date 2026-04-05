@@ -76,8 +76,9 @@ description: "Use when users ask to recruit candidates on Boss Zhipin via the bo
 
 ## Required MCP Tool
 
-- Tool name: `run_recruit_pipeline`
+- Tool name（默认异步）: `run_recruit_pipeline`
 - Input:
+  - `execution_mode` (optional: `async|sync`, default `async`)
   - `instruction` (string, required)
   - `confirmation` (object, optional)
     - `keyword_confirmed` (boolean): 是否确认关键词
@@ -91,7 +92,7 @@ description: "Use when users ask to recruit candidates on Boss Zhipin via the bo
     - `schools` (string[] | comma-separated string)
     - `keyword` (string)
     - `target_count` (number)
-- Tool response 重点字段：
+  - Tool response 重点字段：
   - `status`
   - `required_confirmations`
   - `pending_questions`
@@ -102,9 +103,17 @@ description: "Use when users ask to recruit candidates on Boss Zhipin via the bo
   - `review.default_preview`
   - `review.applied_defaults`
 
+异步工具（可选显式三步）：
+
+- `start_recruit_pipeline_run`
+- `get_recruit_pipeline_run`
+- `cancel_recruit_pipeline_run`
+
 ## Backend Selection
 
 - 默认执行路径：优先使用 MCP 工具 `run_recruit_pipeline`。
+- `run_recruit_pipeline` 默认 async，但会先执行与 sync 一致的前置门禁（参数确认、preflight、页面就绪）；门禁不通过时不会返回 `run_id`。
+- 只有门禁通过后才会返回 `ACCEPTED + run_id`，随后轮询 `get_recruit_pipeline_run`。
 - 如果当前 AI agent 无法添加新的 MCP、MCP 数量受限、或当前会话拿不到该工具：
   - 直接切换到 CLI fallback；
   - 不要放弃流程，也不要要求用户手动把所有步骤重新翻译一遍。

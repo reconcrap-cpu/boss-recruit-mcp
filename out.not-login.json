@@ -1,0 +1,37 @@
+{
+  "status": "FAILED",
+  "error": {
+    "code": "BOSS_LOGIN_REQUIRED",
+    "message": "Boss 椤甸潰鏈ǔ瀹氬仠鐣欏湪 search 椤甸潰锛岀枒浼兼湭鐧诲綍鎴栫櫥褰曟€佸け鏁堛€傝鍏堝湪褰撳墠 Chrome 绐楀彛鎵嬪姩鐧诲綍 Boss锛岀櫥褰曞畬鎴愬悗鍐嶇户缁悳绱㈠拰绛涢€夈€?,
+    "retryable": true
+  },
+  "search_params": {
+    "city": "鏉窞",
+    "degree": "鏈",
+    "schools": [
+      "985闄㈡牎",
+      "211闄㈡牎",
+      "鍙屼竴娴侀櫌鏍?
+    ],
+    "filter_recent_viewed": true,
+    "keyword": "AI infra"
+  },
+  "screen_params": {
+    "criteria": "鍦˙oss涓婃悳绱㈠苟绛涢€夊€欓€変汉锛涚瓫閫夋爣鍑嗭細鍋氳繃 AI infra锛涜繎涓ゅ勾鏈夌浉鍏抽」鐩粡楠?,
+    "target_count": 1
+  },
+  "diagnostics": {
+    "debug_port": 9222,
+    "page_state": {
+      "key": "boss_page_state",
+      "ok": false,
+      "state": "LOGIN_REQUIRED",
+      "path": "https://www.zhipin.com/web/user/?ka=bticket",
+      "current_url": "https://www.zhipin.com/web/user/?ka=bticket",
+      "title": "銆怋OSS鐩磋仒娉ㄥ唽鐧诲綍銆慴oss鐩磋仒鍦ㄧ嚎娉ㄥ唽鐧诲綍-BOSS鐩磋仒",
+      "requires_login": true,
+      "expected_url": "https://www.zhipin.com/web/chat/search",
+      "message": "Boss 椤甸潰娌℃湁鍋滅暀鍦?search 椤甸潰锛岄€氬父琛ㄧず闇€瑕侀噸鏂扮櫥褰曘€傝鎵嬪姩鐧诲綍 Boss 鍚庡啀缁х画銆?
+    }
+  }
+}

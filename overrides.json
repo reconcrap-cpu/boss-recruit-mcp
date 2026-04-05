@@ -1,0 +1,8 @@
+{
+  "city": "杭州",
+  "degree": "硕士及以上",
+  "schools": ["985", "211", "qs100"],
+  "keyword": "算法",
+  "target_count": 5,
+  "filter_recent_viewed": true
+}
